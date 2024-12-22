@@ -20,6 +20,9 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
 )
+# vei:
+from itertools import product
+from collections import defaultdict
 
 
 warnings.simplefilter("once", UserWarning)
@@ -390,6 +393,12 @@ class IGANN:
         else:
             X = X_cat
 
+        # vei:
+        self.grouped_encoded_features = [
+            [self.feature_names.index(c) for c in group]
+            for group in encoded_list
+        ]
+
         return X
 
     def fit(
@@ -712,6 +721,33 @@ class IGANN:
             self.boosting_rates = self.boosting_rates[:best_iter]
 
         return best_loss
+
+    # vei:
+    def _constraint_dt(self, X, y):
+        """
+        This function fits a decision tree to determine the most important combination of one 
+        categorical and one numberical feature.
+        """
+        
+        numerical_features = list(range(self.n_numerical_cols))
+        categorical_features = self.grouped_encoded_features
+
+        best_score = -np.inf
+        best_combination = None
+
+        for num_var, cat_var in product(numerical_features, categorical_features):
+            # Trainiere Modell mit den Variablen num_var und cat_var
+            X_dt = X[:, [num_var, cat_var]]
+            tree = DecisionTreeRegressor(random_state=42, max_depth=4, criterion='squared_error')
+            tree.fit(X_dt, y)
+            score = mean_squared_error(y, tree.predict(X_dt))
+            print(tree.tree_.feature)
+
+            if score > best_score:
+                best_score = score
+                best_combination = [num_var, cat_var]
+
+        return best_combination
 
     def _select_features(self, X, y):
         regressor = ELM_Regressor(
