@@ -22,7 +22,6 @@ from sklearn.metrics import (
 )
 # vei:
 from itertools import product
-from collections import defaultdict
 
 
 warnings.simplefilter("once", UserWarning)
@@ -733,21 +732,24 @@ class IGANN:
         categorical_features = self.grouped_encoded_features
 
         best_score = -np.inf
-        best_combination = None
+        self.best_combination = None
 
         for num_var, cat_var in product(numerical_features, categorical_features):
             # Trainiere Modell mit den Variablen num_var und cat_var
-            X_dt = X[:, [num_var, cat_var]]
-            tree = DecisionTreeRegressor(random_state=42, max_depth=4, criterion='squared_error')
+            X_dt = X[:, [num_var] + cat_var]
+            tree = DecisionTreeRegressor(random_state=42, max_depth=3, criterion='squared_error')
             tree.fit(X_dt, y)
             score = mean_squared_error(y, tree.predict(X_dt))
-            print(tree.tree_.feature)
 
-            if score > best_score:
-                best_score = score
-                best_combination = [num_var, cat_var]
+            if len(set(tree.tree_.feature).difference([-2])) > 1: # only consider decistion tree with more than one feature
+                if score > best_score:
+                    best_score = score
+                    self.best_combination = [num_var] + cat_var
 
-        return best_combination
+        if self.best_combination == None:
+            print('No feature combination found. All decision trees only use one feature. Model does not capture interactions.') 
+
+        return
 
     def _select_features(self, X, y):
         regressor = ELM_Regressor(
