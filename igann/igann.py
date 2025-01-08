@@ -205,6 +205,68 @@ class ELM_Regressor:
         self.output_model = m
         return X_hid
 
+class ELM_IT_Regressor:
+    def __init__(
+        self, 
+        best_combination, 
+        n_hid, 
+        seed=0,
+        elm_scale=10,
+        elm_alpha=0.0001,
+        act="elu", 
+        device="cpu",
+    ):
+        """
+        hier kommt noch die Beschreibung rein
+        """
+        super().__init__()
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        self.best_combination = best_combination
+        self.n_hid = n_hid
+        self.device = device
+        n_cat = len(self.best_combination) # number of categories in the categorical feature (actually -1 as num_feature is included, but + 1 as first category was dropped in encoding step)
+        # random weights for hidden layer
+        self.hidden_list = torch.normal(mean=torch.zeros(n_cat, n_cat * self.n_hid), std=elm_scale).to(device)
+
+        mask = torch.block_diag(*[torch.ones(self.n_hid)] * n_cat).to(self.device) # mask to keep in random weight matrix only in first row weights for neurons for first category, in second row for second category, ...
+        self.hidden_mat = self.hidden_list * mask # delete not needed random weights
+        self.output_model = None
+        self.elm_scale = elm_scale
+        self.elm_alpha = elm_alpha
+        if act == "elu":
+            self.act = torch.nn.ELU()
+        elif act == "relu":
+            self.act = torch.nn.ReLU()
+        else:
+            self.act = act
+
+    def get_hidden_values(self, X):
+        X_num_feature = X[:, 0]
+        X_cat_feature = torch.hstack((X[:, 1:], 1 ^ X[:, 1:].sum(dim=1).unsqueeze(1).int())) # add new column to restore first category (was dropped in encoding step)
+        X_comb_feature = X_num_feature.unsqueeze(1) * X_cat_feature
+        X_hid = X_comb_feature @ self.hidden_mat # create list of hidden values
+        X_hid = self.act(X_hid) # apply activation function
+
+        return X_hid
+    
+    def predict(self, X, hidden=False):
+        """
+        """
+        if hidden:
+            X_hid = X
+        else:
+            X_hid = self.get_hidden_values(X)
+
+        out = X_hid @ self.output_model.coef_
+        return out
+
+    def fit(self, X, y):
+        X_hid = self.get_hidden_values(X)
+        m = torch_Ridge(alpha=self.elm_alpha, device=self.device)
+        m.fit(X_hid, y)
+        self.output_model = m
+        return X_hid
 
 class IGANN:
     """
@@ -336,6 +398,18 @@ class IGANN:
         self.val_losses = []
         self.test_losses = []
         self.regressor_predictions = []
+        # vei: latest y_hat is needed after ELMs also for ELM_ITs
+        self.y_hats = []
+        # vei: store regressors_it separately
+        self.regressors_it = []
+        # vei: store boosting rates for regressors_it
+        self.boosting_rates_it = []
+        # vei: store train losses for regressors_it
+        self.train_losses_it = []
+        # vei: store val losses for regressors_it
+        self.val_losses_it = []
+        # vei: store regressor_it predictions separately
+        self.regressor_predictions_it = []
 
     def _preprocess_feature_matrix(self, X, fit_dummies=False):
         if type(X) != pd.DataFrame:
@@ -681,6 +755,8 @@ class IGANN:
             self.boosting_rates.append(self.boost_rate)
             self.train_losses.append(train_loss.cpu())
             self.val_losses.append(val_loss.cpu())
+            # vei: store y_hat for ELM_IT
+            self.y_hats.append(y_hat)
 
             # This is the early stopping mechanism. If there was no improvement on the
             # validation set, we increase a counter by 1. If there was an improvement,
@@ -718,6 +794,84 @@ class IGANN:
                 print(f"Cutting at {best_iter}")
             self.regressors = self.regressors[:best_iter]
             self.boosting_rates = self.boosting_rates[:best_iter]
+            # vei: drop also y_hats
+            self.y_hats = self.y_hats[:best_iter]
+
+        # vei: AB HIER ELM_IT
+        # execute method to get the best feature combination
+        self.best_combination = self._constraint_dt(X, y)
+
+        # X dataset only for cat features
+        X_it = X[:, self.best_combination]
+        X_val_it = X_val[:, self.best_combination]
+
+        # update y_hat to prediction of best ELM iteration
+        y_hat = self.y_hats[-1]
+
+        counter_no_progress = 0
+        best_iter = 0
+
+        # Sequentially fit one ELM for the Interaction pair after the other. Max number is stored in self.n_estimators.
+        for counter in range(self.n_estimators):
+            hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
+            y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
+                y, y_hat
+            )
+
+            # init ELM_IT Regressor
+            regressor = ELM_IT_Regressor(
+                best_combination = self.best_combination, 
+                n_hid = self.n_hid,
+                seed=counter,
+                elm_scale=self.elm_scale,
+                elm_alpha=self.elm_alpha,
+                act=self.act, 
+                device=self.device,
+                )
+
+            # Fit ELM regressor
+            X_hid = regressor.fit(X_it, y_tilde)
+
+            # Make a prediction of the ELM for the update of y_hat
+            train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
+            val_regressor_pred = regressor.predict(X_val_it).squeeze()
+
+            self.regressor_predictions_it.append(train_regressor_pred)
+
+            # Update the prediction for training and validation data
+            y_hat += self.boost_rate * train_regressor_pred
+            y_hat_val += self.boost_rate * val_regressor_pred
+
+            y_hat = self._clip_p(y_hat)
+            y_hat_val = self._clip_p(y_hat_val)
+
+            train_loss = self.criterion(y_hat, y)
+            val_loss = self.criterion(y_hat_val, y_val)
+
+            # Keep the ELM, the boosting rate and losses in lists, so
+            # we can later use them again.
+            self.regressors_it.append(regressor)
+            self.boosting_rates_it.append(self.boost_rate)
+            self.train_losses_it.append(train_loss.cpu())
+            self.val_losses_it.append(val_loss.cpu())
+
+            # early stopping
+            counter_no_progress += 1
+            if val_loss < best_loss:
+                best_iter = counter + 1
+                best_loss = val_loss
+                counter_no_progress = 0
+
+            # Stop training if the counter for early stopping is greater than the parameter we passed.
+            if counter_no_progress > self.early_stopping and self.early_stopping > 0:
+                break
+
+        if self.early_stopping > 0:
+            # We remove the ELMs that did not improve the performance. Most likely best_iter equals self.early_stopping.
+            if self.verbose > 0:
+                print(f"Cutting at {best_iter}")
+            self.regressors_it = self.regressors_it[:best_iter]
+            self.boosting_rates_it = self.boosting_rates_it[:best_iter]
 
         return best_loss
 
@@ -732,7 +886,7 @@ class IGANN:
         categorical_features = self.grouped_encoded_features
 
         best_score = -np.inf
-        self.best_combination = None
+        best_combination = None
 
         for num_var, cat_var in product(numerical_features, categorical_features):
             # Trainiere Modell mit den Variablen num_var und cat_var
@@ -744,12 +898,12 @@ class IGANN:
             if len(set(tree.tree_.feature).difference([-2])) > 1: # only consider decistion tree with more than one feature
                 if score > best_score:
                     best_score = score
-                    self.best_combination = [num_var] + cat_var
+                    best_combination = [num_var] + cat_var
 
-        if self.best_combination == None:
+        if best_combination == None:
             print('No feature combination found. All decision trees only use one feature. Model does not capture interactions.') 
 
-        return
+        return best_combination
 
     def _select_features(self, X, y):
         regressor = ELM_Regressor(
