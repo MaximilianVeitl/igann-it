@@ -21,7 +21,7 @@ from sklearn.metrics import (
     f1_score,
 )
 # vei:
-from itertools import product
+from itertools import product, combinations
 
 
 warnings.simplefilter("once", UserWarning)
@@ -294,6 +294,7 @@ class IGANN:
         random_state=1,
         optimize_threshold=False,
         verbose=0,
+        interaction_detection_method='dt',
     ):
         """
         Initializes the model. Input parameters:
@@ -313,6 +314,7 @@ class IGANN:
         optimize_threshold: if True, the threshold for the classification is optimized using train data only and using the ROC curve. Otherwise, per default the raw logit value greater 0 means class 1 and less 0 means class -1.
         verbose: tells how much information should be printed when fitting. Can be 0 for (almost) no
         information, 1 for printing losses, and 2 for plotting shape functions in each iteration.
+        interaction_detection_method: method to detect interactions. Can be 'dt' or 'FAST'.
         """
         self.task = task
         self.n_hid = n_hid
@@ -327,6 +329,7 @@ class IGANN:
         self.random_state = random_state
         self.optimize_threshold = optimize_threshold
         self.verbose = verbose
+        self.interaction_detection_method = interaction_detection_method
         ###### this is not needed since these are just for one run! ######
         # self.regressors = []
         # self.boosting_rates = []
@@ -400,6 +403,7 @@ class IGANN:
         self.regressor_predictions = []
         # vei: latest y_hat is needed after ELMs also for ELM_ITs
         self.y_hats = []
+        self.y_hats_val = []
         # vei: store regressors_it separately
         self.regressors_it = []
         # vei: store boosting rates for regressors_it
@@ -757,6 +761,7 @@ class IGANN:
             self.val_losses.append(val_loss.cpu())
             # vei: store y_hat for ELM_IT
             self.y_hats.append(y_hat)
+            self.y_hats_val.append(y_hat_val)
 
             # This is the early stopping mechanism. If there was no improvement on the
             # validation set, we increase a counter by 1. If there was an improvement,
@@ -796,17 +801,21 @@ class IGANN:
             self.boosting_rates = self.boosting_rates[:best_iter]
             # vei: drop also y_hats
             self.y_hats = self.y_hats[:best_iter]
+            self.y_hats_val = self.y_hats_val[:best_iter]
 
         # vei: AB HIER ELM_IT
+        # update y_hat to prediction of best ELM iteration
+        y_hat = self.y_hats[-1]
+        y_hat_val = self.y_hats_val[-1]
+        y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
+                y, y_hat
+            )
         # execute method to get the best feature combination
-        self.best_combination = self._constraint_dt(X, y)
+        self.best_combination = self._find_interactions(X, y_tilde, self.interaction_detection_method)
 
         # X dataset only for cat features
         X_it = X[:, self.best_combination]
         X_val_it = X_val[:, self.best_combination]
-
-        # update y_hat to prediction of best ELM iteration
-        y_hat = self.y_hats[-1]
 
         counter_no_progress = 0
         best_iter = 0
@@ -876,7 +885,7 @@ class IGANN:
         return best_loss
 
     # vei:
-    def _constraint_dt(self, X, y):
+    def _constraint_dt(self, X, y_tilde):
         """
         This function fits a decision tree to determine the most important combination of one 
         categorical and one numberical feature.
@@ -892,8 +901,8 @@ class IGANN:
             # Trainiere Modell mit den Variablen num_var und cat_var
             X_dt = X[:, [num_var] + cat_var]
             tree = DecisionTreeRegressor(random_state=42, max_depth=3, criterion='squared_error')
-            tree.fit(X_dt, y)
-            score = mean_squared_error(y, tree.predict(X_dt))
+            tree.fit(X_dt, y_tilde)
+            score = mean_squared_error(y_tilde, tree.predict(X_dt))
 
             if len(set(tree.tree_.feature).difference([-2])) > 1: # only consider decistion tree with more than one feature
                 if score > best_score:
@@ -904,6 +913,232 @@ class IGANN:
             print('No feature combination found. All decision trees only use one feature. Model does not capture interactions.') 
 
         return best_combination
+    
+    # vei:
+    def _FAST_detection(self, X, y_tilde, n_bins):
+        # andere funktionen einbauen
+        # X_complete_decoded evtl löschen
+        """
+        FAST - Interaction Detection
+
+        This module exposes a method called FAST [1] to measure and rank the strengths
+        of the interaction of all pairs of features in a dataset.
+
+        [1] https://www.cs.cornell.edu/~yinlou/papers/lou-kdd13.pdf
+
+        Args:
+            X (torch.Tensor): Feature-Matrix.
+            y_tilde (torch.Tensor): Residuals of univariate model.
+            n_bins (int): Number of bins in which the numerical features are split. Defaults to 20.
+            Returns:
+            dict: Ein Dictionary mit den Ergebnissen.
+        """
+        # Split X in numerical and categorical features
+        # X_num
+        X_num = X[:, :self.n_numerical_cols]
+        # split X_cat and decode it
+        X_cat = X[:, self.n_numerical_cols:]
+        for indices in self.grouped_encoded_features:
+            cat = 0
+            new_col = torch.zeros(X_cat.shape[0])
+            for i in indices:
+                cat += 1
+                new_col += cat * X_cat[:, i-self.n_numerical_cols]
+            X_cat = torch.hstack((X_cat, new_col.reshape(-1, 1)))
+        X_cat = X_cat[:, self.n_categorical_cols:]
+
+        # Marginal und cumulative histograms for numerical features
+        histo_mar_num = {}
+        histo_cum_num = {}
+        for feature_idx in range(X_num.shape[1]):
+            bins = np.percentile(X_num[:, feature_idx], np.linspace(0, 100, n_bins + 1))
+            bins[-1] += 1e-6
+            bin_indices = np.digitize(X_num[:, feature_idx], bins) - 1
+            histo_mar_num[feature_idx] = {
+                "bin_edges": bins,
+                "H_t": np.zeros(n_bins),
+                "H_w": np.zeros(n_bins),
+            }
+            histo_cum_num[feature_idx] = {
+                "bin_edges": bins,
+                "H_t": np.zeros(n_bins),
+                "H_w": np.zeros(n_bins),
+            }
+            for bin_idx in range(n_bins):
+                mask = bin_indices == bin_idx
+                H_t = y_tilde[mask].sum()
+                H_w = mask.sum()
+                histo_mar_num[feature_idx]["H_t"][bin_idx] = H_t
+                histo_mar_num[feature_idx]["H_w"][bin_idx] = H_w
+                histo_cum_num[feature_idx]["H_t"][bin_idx] = histo_cum_num[feature_idx]["H_t"][bin_idx-1] + H_t
+                histo_cum_num[feature_idx]["H_w"][bin_idx] = histo_cum_num[feature_idx]["H_w"][bin_idx-1] + H_w
+
+        # Histograms for categorical features
+        histo_cat = {}
+        for feature_idx in range(X_cat.shape[1]):
+            unique_values = np.unique(X_cat[:, feature_idx]).astype(int).tolist()
+            # Marginal histograms for single categories
+            marg_histo = {
+                "unique_values": unique_values,
+                "H_t": np.zeros(len(unique_values)),
+                "H_w": np.zeros(len(unique_values)),
+            }
+            for unique_value_idx, unique_value in enumerate(unique_values):
+                mask = X_cat[:, feature_idx] == unique_value
+                mask = mask.numpy()
+                marg_histo["H_t"][unique_value_idx] = y_tilde[mask].sum()
+                marg_histo["H_w"][unique_value_idx] = mask.sum()
+            # Generate all possible divisions of categories if splitting into two groups
+            partitions = []
+            right_partitions = []
+            if len(unique_values) > 6:
+                warnings.warn("The " + str((feature_idx+1)) + "-th categorical feature has k = " + str(len(unique_values)) + " unique values, resulting in 2**(k-1) - 1 possible paritions of the feature into two groups. Simulating the best split may take a while. Consider using an alternative method for the interaction detection.")
+            for size in range(1, len(unique_values)):
+                for left in combinations(unique_values, size):
+                    left_set = set(left)
+                    right_set = set(unique_values) - left_set
+                    if left_set not in right_partitions:
+                        partitions.append(left_set)
+                        right_partitions.append(right_set)
+            histo_cat[feature_idx] = {
+                "partition": partitions,
+                "H_t": np.zeros(len(partitions)),
+                "H_w": np.zeros(len(partitions)),
+            }
+            # Histograms for combinations of categories within partitions
+            for partition_idx, partition in enumerate(partitions):
+                if len(partition) == 1:
+                    histo_cat[feature_idx]["H_t"][partition_idx] = marg_histo["H_t"][unique_values.index(list(partition)[0])]
+                    histo_cat[feature_idx]["H_w"][partition_idx] = marg_histo["H_w"][unique_values.index(list(partition)[0])]
+                else:
+                    H_t = 0
+                    H_w = 0
+                    for value in partition:
+                        value_idx = marg_histo["unique_values"].index(value)
+                        H_t += marg_histo["H_t"][value_idx]
+                        H_w += marg_histo["H_w"][value_idx]
+                    histo_cat[feature_idx]["H_t"][partition_idx] = H_t
+                    histo_cat[feature_idx]["H_w"][partition_idx] = H_w 
+
+        # Digitize X_num in bins
+        X_digitized = X_num.clone()
+        for column in range(X_num.shape[1]):
+            bins = histo_cum_num[column]['bin_edges']
+            bin_indices = np.digitize(X_num[:, column], bins) - 1
+            X_digitized[:, column] = torch.tensor(bin_indices, dtype=torch.int64)
+        # Generate all possible feature pairs
+        numerical_features = list(range(self.n_numerical_cols))
+        categorical_features = [x + self.n_numerical_cols for x in list(range(X_cat.shape[1]))]
+        feature_pairs = list(product(numerical_features, categorical_features))
+
+        RSS = {
+            "pair": feature_pairs,
+            "RSS": np.zeros(len(feature_pairs)),
+            "split_num": np.array([""] * len(feature_pairs)),
+            "split_cat": np.array([""] * len(feature_pairs)),
+            }
+        pair_idx = 0
+        for pair in feature_pairs:
+            num_feat = pair[0]
+            cat_feat = pair[1] - self.n_numerical_cols
+            n_unique_values = X_cat[:, cat_feat].unique().shape[0]
+
+            # create lookup tables to store the sum of residuals, the number of samples, and the interaction predictor for each quadrant of the split
+            columns = []
+            for i in histo_cat[cat_feat]["partition"]:
+                columns.append(str(i))
+            index = [f"< {value:.2f}" for value in histo_cum_num[num_feat]['bin_edges'][1:]]
+            lookup_t_a = pd.DataFrame(columns=columns, index=index)
+            lookup_w_a = pd.DataFrame(columns=columns, index=index)
+            lookup_t_b = pd.DataFrame(columns=columns, index=index)
+            lookup_w_b = pd.DataFrame(columns=columns, index=index)
+            lookup_T_b = pd.DataFrame(columns=columns, index=index)
+            lookup_t_c = pd.DataFrame(columns=columns, index=index)
+            lookup_w_c = pd.DataFrame(columns=columns, index=index)
+            lookup_T_c = pd.DataFrame(columns=columns, index=index)
+            lookup_t_d = pd.DataFrame(columns=columns, index=index)
+            lookup_w_d = pd.DataFrame(columns=columns, index=index)
+            lookup_T_d = pd.DataFrame(columns=columns, index=index)
+    
+            # fill lookup table with sum of resuduals and number of samples for quadrant a
+            for col in lookup_t_a.columns[:n_unique_values]:
+                partition = set(map(int, col.strip("{}").split(", ")))
+                bin = 0
+                h_t = 0
+                h_w = 0
+                for index in lookup_t_a.index:
+                    mask = X_digitized[:, num_feat] == bin
+                    mask2 = torch.isin(X_cat[:, (cat_feat)], torch.tensor(list(partition)))
+                    mask3 = mask & mask2
+                    h_t = h_t + y_tilde[mask3].sum()
+                    h_w = h_w + mask3.sum()
+                    lookup_t_a.loc[index, col] = h_t
+                    lookup_w_a.loc[index, col] = h_w.item()
+                    bin += 1
+            # for partitions with more than one category in each split group
+            for col in lookup_t_a.columns[n_unique_values:]:
+                cols = [f"{{{value.strip()}}}" for value in col.strip("{}").split(",")]
+                lookup_t_a.loc[:, col] = lookup_t_a.loc[:, cols].sum(axis=1)
+                lookup_w_a.loc[:, col] = lookup_w_a.loc[:, cols].sum(axis=1)
+            # calculate interaction predictor for quadrant a
+            lookup_T_a = lookup_t_a.div(lookup_w_a)
+            # calculate sum of residuals, the number of samples, and the interaction predictor for quadrant b
+            h_t_values = pd.Series(histo_cum_num[num_feat]['H_t'], index=lookup_t_a.index)
+            h_t_x_i_frame = pd.DataFrame({col: h_t_values for col in lookup_t_a.columns})
+            lookup_t_b = h_t_x_i_frame.sub(lookup_t_a, axis=0)
+            h_w_values = pd.Series(histo_cum_num[num_feat]['H_w'], index=lookup_w_a.index)
+            h_w_x_i_frame = pd.DataFrame({col: h_w_values for col in lookup_w_a.columns})
+            lookup_w_b = h_w_x_i_frame.sub(lookup_w_a, axis=0)
+            lookup_T_b = lookup_t_b.div(lookup_w_b)
+            # calculate sum of residuals, the number of samples, and the interaction predictor for quadrant c
+            h_t_x_j_frame = pd.DataFrame([histo_cat[cat_feat]['H_t']] * len(lookup_t_a.index), index=lookup_t_a.index, columns=lookup_t_a.columns)
+            lookup_t_c = h_t_x_j_frame.sub(lookup_t_a, axis=0)
+            h_w_x_j_frame = pd.DataFrame([histo_cat[cat_feat]['H_w']] * len(lookup_w_a.index), index=lookup_w_a.index, columns=lookup_w_a.columns)
+            lookup_w_c = h_w_x_j_frame.sub(lookup_w_a, axis=0)
+            lookup_T_c = lookup_t_c.div(lookup_w_c)
+            # calculate sum of residuals, the number of samples, and the interaction predictor for quadrant d
+            ch__x_d_t = histo_cum_num[num_feat]['H_t'][-1] - h_t_x_i_frame
+            lookup_t_d = ch__x_d_t.sub(lookup_t_c, axis=0)
+            ch__x_d_w = histo_cum_num[num_feat]['H_w'][-1] - h_w_x_i_frame
+            lookup_w_d = ch__x_d_w.sub(lookup_w_c, axis=0)
+            lookup_T_d = lookup_t_d.div(lookup_w_d)
+            # calculate RSS for all possible splits
+            term_1 = (lookup_T_a**2) * lookup_w_a + (lookup_T_b**2) * lookup_w_b + (lookup_T_c**2) * lookup_w_c + (lookup_T_d**2) * lookup_w_d
+            term_2 = 2 * (lookup_T_a * lookup_t_a + lookup_T_b * lookup_t_b + lookup_T_c * lookup_t_c + lookup_T_d * lookup_t_d)
+            rss = - term_1 - term_2
+            # find best split for pair in this loop
+            min_RSS = rss.min().min()
+            RSS["RSS"][pair_idx] = min_RSS
+            position = (rss == min_RSS).stack().idxmax()
+            RSS["split_num"][pair_idx] = position[0]
+            RSS["split_cat"][pair_idx] = position[1]
+
+            pair_idx += 1
+
+        # interaction pair with lowest RSS
+        best_pair = RSS["pair"][RSS["RSS"].argmin()]
+        best_combination = [best_pair[0]] + self.grouped_encoded_features[best_pair[1]-self.n_numerical_cols]
+
+        return best_combination
+    
+    # vei:
+    def _find_interactions(self, X, y_tilde, method="dt"):
+        """
+        This function finds the most important interaction pair between a numerical and a categorical feature.
+        X: the feature matrix for the training data
+        y: the residuals of the trained univariate model
+        method: the method to find the most important interaction pair. 
+                - 'dt' for decision tree
+                - 'FAST' for FAST algorithm.
+        """
+        if method == "dt":
+            best_pair = self._constraint_dt(X, y_tilde)
+        elif method == "FAST":
+            best_pair = self._FAST_detection(X, y_tilde, n_bins=20)
+        else:
+            warnings.warn("Method not implemented. Use 'dt' or 'FAST'.")
+
+        return best_pair
 
     def _select_features(self, X, y):
         regressor = ELM_Regressor(
