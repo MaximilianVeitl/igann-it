@@ -894,7 +894,7 @@ class IGANN:
         numerical_features = list(range(self.n_numerical_cols))
         categorical_features = self.grouped_encoded_features
 
-        best_score = -np.inf
+        best_score = np.inf
         best_combination = None
 
         for num_var, cat_var in product(numerical_features, categorical_features):
@@ -905,7 +905,7 @@ class IGANN:
             score = mean_squared_error(y_tilde, tree.predict(X_dt))
 
             if len(set(tree.tree_.feature).difference([-2])) > 1: # only consider decistion tree with more than one feature
-                if score > best_score:
+                if score < best_score:
                     best_score = score
                     best_combination = [num_var] + cat_var
 
