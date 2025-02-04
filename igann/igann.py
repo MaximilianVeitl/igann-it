@@ -22,6 +22,8 @@ from sklearn.metrics import (
 )
 # vei:
 from itertools import product, combinations
+import plotly.graph_objects as go
+import plotly.express as px
 
 
 warnings.simplefilter("once", UserWarning)
@@ -193,6 +195,18 @@ class ELM_Regressor:
             out = x_in @ self.output_model.coef_[start_idx : start_idx + 1].unsqueeze(1)
         return out
 
+    # vei: added this function to predict the output of a feature pair
+    def predict_it(self, X, int_pair):
+        num_idx = [int_pair[0] * self.n_hid + i for i in range(self.n_hid)]
+        cat_idx = [i - self.n_numerical_cols + (self.n_numerical_cols * self.n_hid) for i in int_pair[1:]]
+        coef_idx = num_idx + cat_idx
+        X_hid = X[:, 0].reshape(len(X), 1) @ self.hidden_mat[int_pair[0], num_idx].reshape(1, self.n_hid)
+        X_hid = self.act(X_hid)
+        X_hid = torch.cat((X_hid, X[:, 1:]), dim=1)
+        out = X_hid @ self.output_model.coef_[[coef_idx]]
+
+        return out
+
     def fit(self, X, y, mult_coef):
         """
         This function fits the ELM on the training data (X, y).
@@ -261,10 +275,11 @@ class ELM_IT_Regressor:
         out = X_hid @ self.output_model.coef_
         return out
 
-    def fit(self, X, y):
+    def fit(self, X, y, mult_coef):
         X_hid = self.get_hidden_values(X)
+        X_hid_mult = X_hid * mult_coef
         m = torch_Ridge(alpha=self.elm_alpha, device=self.device)
-        m.fit(X_hid, y)
+        m.fit(X_hid_mult, y)
         self.output_model = m
         return X_hid
 
@@ -434,6 +449,9 @@ class IGANN:
             self.n_numerical_cols = X_num.shape[1]
         else:
             self.n_numerical_cols = 0
+        
+        #vei: store dropped categories
+        self.dropped_categories = {}
 
         if len(categorical_cols) > 0:
             if fit_dummies:
@@ -452,6 +470,15 @@ class IGANN:
             self.dummy_encodings = dict(
                 zip(self._flatten(encoded_list), self._flatten(original_list))
             )
+            
+            # vei: store dropped categories
+            for col in categorical_cols:
+                all_categories = [str(val) for val in X[col].unique()]
+                dummy_cols = [c.split("_", 1)[-1] for c in one_hot_encoded.columns if c.startswith(col + "_")]
+                dropped_category = list(set(all_categories) - set(dummy_cols))
+                if dropped_category:
+                    self.dropped_categories[col] = dropped_category[0] 
+
             X_cat = torch.from_numpy(one_hot_encoded.values.astype(float)).float()
             self.n_categorical_cols = X_cat.shape[1]
             self.feature_names = numerical_cols + list(one_hot_encoded.columns)
@@ -817,6 +844,9 @@ class IGANN:
         X_it = X[:, self.best_combination]
         X_val_it = X_val[:, self.best_combination]
 
+        # vei: store unique values of interaction features
+        self.unique_it = torch.unique(X_it, dim=0)
+
         counter_no_progress = 0
         best_iter = 0
 
@@ -839,7 +869,13 @@ class IGANN:
                 )
 
             # Fit ELM regressor
-            X_hid = regressor.fit(X_it, y_tilde)
+            X_hid = regressor.fit(
+                X_it, 
+                y_tilde,
+                torch.sqrt(torch.tensor(0.5).to(self.device))
+                * self.boost_rate
+                * hessian_train_sqrt[:, None],
+                )
 
             # Make a prediction of the ELM for the update of y_hat
             train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
@@ -1335,6 +1371,31 @@ class IGANN:
                 * regressor.predict_single(feat_values.reshape(-1, 1), i).squeeze()
             ).cpu()
         return feat_values, pred
+    
+    # vei:
+    def _get_pred_it(self):
+        feat_values = self.unique_it
+        feat_values = feat_values.to(self.device)
+        pred_it = torch.zeros(len(feat_values), dtype=torch.float32).to(self.device)
+
+        for regressor, boost_rate in zip(self.regressors_it, self.boosting_rates_it):
+            pred_it += (
+                boost_rate
+                * regressor.predict(feat_values).squeeze() # hier ist eventuell ein Fehler
+            ).cpu()
+
+        pred = pred_it.clone()
+
+        if self.task == "classification":
+            # to - do
+            print('classification not implemented yet')
+        else:
+            pred += (torch.from_numpy(self.init_classifier.coef_[self.best_combination].astype(np.float32)) @ feat_values.transpose(0,1))
+        
+        for regressor, boost_rate in zip(self.regressors, self.boosting_rates):
+            pred += (boost_rate * regressor.predict_it(feat_values, self.best_combination).squeeze()).cpu()
+
+        return feat_values, pred_it, pred
 
     def _compress_shape_functions_dict(self, shape_functions):
         shape_functions_compressed = {}
@@ -1412,6 +1473,34 @@ class IGANN:
                 d["avg_effect"] = 0
         shape_functions = self._compress_shape_functions_dict(shape_functions)
 
+        return shape_functions
+    
+    # vei:
+    def get_it_shape_functions_as_dict(self):
+        # predict for each unique combination of the best interaction pair. unique combinations are stored in self.unique_it and get return by self._get_pred_it()
+        feat_values, pred_it, pred = self._get_pred_it()
+        x_values = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
+        y_values = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
+        y_incl_univ = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
+
+        # Iterate through rows and assign values to the corresponding column list
+        for row_idx, row in enumerate(feat_values):
+            if torch.all(row[1:] == 0):
+                x_values["category 1"].append(row[0].item())
+                y_values["category 1"].append(pred_it[row_idx].item())
+                y_incl_univ["category 1"].append(pred[row_idx].item())
+            else:
+                for col_index in range(1, feat_values.shape[1]):  # Start checking from column 2
+                    if row[col_index] == 1:
+                        x_values[f"category {col_index + 1}"].append(row[0].item())
+                        y_values[f"category {col_index + 1}"].append(pred_it[row_idx].item())
+                        y_incl_univ[f"category {col_index + 1}"].append(pred[row_idx].item())
+                        break  # Stop after assigning the row to one column
+
+        shape_functions = [
+            {"name": col, "x": x_values[col], "y": y_values[col], "y_incl_univ": y_incl_univ[col]}
+            for col in x_values.keys() if x_values[col]
+        ]
         return shape_functions
 
     def plot_single(
@@ -1608,6 +1697,148 @@ class IGANN:
                 axs[1][i].get_xaxis().set_visible(False)
                 axs[1][i].get_yaxis().set_visible(False)
         plt.show()
+
+    # vei:
+    def plot_it(self, include_univariate=False):
+        if include_univariate:
+            y_values = "y_incl_univ"
+        else:
+            y_values = "y"
+
+        shape_functions = self.get_it_shape_functions_as_dict()
+        plt.close(fig="Shape functions")
+
+        # Seaborn-Theme nur für diesen Plot aktivieren
+        with sns.axes_style("whitegrid",
+                            {"grid.color": "#f0f0f0",
+                             "axes.edgecolor": "0.3",
+                             "axes.linewidth": 1}
+                             ):
+            
+            sns.set_context("notebook", font_scale=1)
+            
+            colors = sns.color_palette("rocket_r", n_colors=len(shape_functions))
+            fig, axs = plt.subplots(1, 1, figsize=(14, 6), num="Shape functions", constrained_layout=False, dpi=100) # dpi für Masterarbeit dann auf 2 bis 300 erhöhen
+            
+            fig.patch.set_alpha(0)  # Transparenter Hintergrund für Figur
+
+
+            for i, d in enumerate(shape_functions):
+                color = colors[i % len(colors)]
+                if i == 0:
+                    feature_name = self.dropped_categories[self.feature_names[self.best_combination[1]].split("_")[0]]
+                else:
+                    feature_name = self.feature_names[self.best_combination[i]].split("_")[1]
+
+                axs.plot(d["x"], d[y_values], linewidth=2.5, color=color, alpha=0.8, 
+                        label=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}")
+
+                axs.axhline(y=0, color="#404040", linestyle="-", linewidth=0.8, alpha=0.6)
+
+            axs.set_xlabel(self.feature_names[self.best_combination[0]], fontsize=14, labelpad=10, fontweight='semibold')
+            axs.set_ylabel("Contribution to Prediction $\\hat{y}$", fontsize=14, labelpad=10, fontweight='semibold')
+            axs.set_title(
+                f"Feature Interaction: Contribution of {self.feature_names[self.best_combination[0]]} and "
+                f"{self.feature_names[self.best_combination[-1]].split('_')[0]} to the Prediction",
+                fontsize=16, fontweight="bold", pad=15
+            )
+
+            axs.tick_params(axis='x', labelrotation=45, labelsize=12)
+            axs.tick_params(axis='y', labelsize=12)
+            axs.grid(visible=True, which='major', axis='both', linestyle='--', alpha=0.6)
+            axs.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=12, frameon=True, shadow=False, fancybox=True, borderpad=1)
+            axs.spines["bottom"].set_color("#404040")  # Untere Linie dunkelgrau
+            axs.spines["left"].set_color("#404040")    # Linke Linie dunkelgrau
+            axs.spines["bottom"].set_linewidth(0.8)  # Untere Linie dicker machen
+            axs.spines["left"].set_linewidth(0.8)    # Linke Linie dicker machen
+            sns.despine(left=False, bottom=False)
+            plt.tight_layout(rect=[0, 0, 0.85, 0.95])  # Platz für Legende lassen
+            plt.subplots_adjust(right=0.8)  # Rechts mehr Platz für Legende
+            plt.show()
+
+
+    # vei: interaktiver Plot
+    # def plot_it(self):
+    #     shape_functions = self.get_it_shape_functions_as_dict()
+
+    #     colors = px.colors.sequential.Viridis[::-1]  # Ähnliche Farbpalette wie "rocket_r"
+        
+    #     fig = go.Figure()
+
+    #     # Erstellen der Daten für beide Y-Werte
+    #     traces_y_incl_univ = []
+    #     traces_y = []
+
+    #     for i, d in enumerate(shape_functions):
+    #         color = colors[i % len(colors)]
+            
+    #         if i == 0:
+    #             feature_name = self.dropped_categories[self.feature_names[self.best_combination[1]].split("_")[0]]
+    #         else:
+    #             feature_name = self.feature_names[self.best_combination[i]].split("_")[1]
+
+    #         # Linien für y_incl_univ
+    #         traces_y_incl_univ.append(go.Scatter(
+    #             x=d["x"],
+    #             y=d["y_incl_univ"],
+    #             mode="lines",
+    #             line=dict(color=color, width=2.5),
+    #             name=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}",
+    #             visible=True  # Standardmäßig sichtbar
+    #         ))
+
+    #         # Linien für y (die alternative Option)
+    #         traces_y.append(go.Scatter(
+    #             x=d["x"],
+    #             y=d["y"],
+    #             mode="lines",
+    #             line=dict(color=color, width=2.5, dash="dot"),  # Gepunktete Linien als Unterschied
+    #             name=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}",
+    #             visible=False  # Standardmäßig unsichtbar
+    #         ))
+
+    #     # Beide Trace-Gruppen zur Figur hinzufügen
+    #     for trace in traces_y_incl_univ:
+    #         fig.add_trace(trace)
+    #     for trace in traces_y:
+    #         fig.add_trace(trace)
+
+    #     # Layout & Styling
+    #     fig.update_layout(
+    #         title_text=f"Feature Interaction: Contribution of {self.feature_names[self.best_combination[0]]} and "
+    #                 f"{self.feature_names[self.best_combination[-1]].split('_')[0]} to the Prediction",
+    #         title_font=dict(size=16, family="Arial", color="black"),
+    #         xaxis=dict(title=self.feature_names[self.best_combination[0]], tickangle=45, tickfont=dict(size=12)),
+    #         yaxis=dict(title="Contribution to Prediction $\\hat{y}$", title_font=dict(size=14)),
+    #         plot_bgcolor="#f5f5f5",
+    #         legend=dict(x=1.02, y=1, bgcolor="rgba(255,255,255,0.5)", bordercolor="black", borderwidth=1),
+    #         margin=dict(r=200, t=80, b=50, l=60),  # Mehr Platz für die Legende
+    #         updatemenus=[
+    #             {
+    #                 "buttons": [
+    #                     {
+    #                         "label": "y_incl_univ",
+    #                         "method": "update",
+    #                         "args": [{"visible": [True] * len(traces_y_incl_univ) + [False] * len(traces_y)}]
+    #                     },
+    #                     {
+    #                         "label": "y",
+    #                         "method": "update",
+    #                         "args": [{"visible": [False] * len(traces_y_incl_univ) + [True] * len(traces_y)}]
+    #                     }
+    #                 ],
+    #                 "direction": "down",
+    #                 "showactive": True,
+    #                 "x": 0.17,
+    #                 "xanchor": "left",
+    #                 "y": 1.15,
+    #                 "yanchor": "top"
+    #             }
+    #         ]
+    #     )
+
+    #     fig.show()
+
 
     def plot_learning(self):
         """
