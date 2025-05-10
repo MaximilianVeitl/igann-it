@@ -5,10 +5,10 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.linear_model import LogisticRegression, Lasso
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, Lasso, LassoCV
 from sklearn.metrics import roc_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeRegressor
+from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 import matplotlib.pyplot as plt
 import seaborn as sns
 import abess.linear
@@ -21,9 +21,14 @@ from sklearn.metrics import (
     f1_score,
 )
 # vei:
+from sklearn.ensemble import BaggingRegressor, BaggingClassifier
+from sklearn.preprocessing import StandardScaler
 from itertools import product, combinations
 import plotly.graph_objects as go
 import plotly.express as px
+import matplotlib.ticker as mticker
+from matplotlib.ticker import MultipleLocator
+from collections import defaultdict
 
 
 warnings.simplefilter("once", UserWarning)
@@ -416,9 +421,6 @@ class IGANN:
         self.val_losses = []
         self.test_losses = []
         self.regressor_predictions = []
-        # vei: latest y_hat is needed after ELMs also for ELM_ITs
-        self.y_hats = []
-        self.y_hats_val = []
         # vei: store regressors_it separately
         self.regressors_it = []
         # vei: store boosting rates for regressors_it
@@ -498,10 +500,11 @@ class IGANN:
             X = X_cat
 
         # vei:
-        self.grouped_encoded_features = [
-            [self.feature_names.index(c) for c in group]
-            for group in encoded_list
-        ]
+        if len(categorical_cols) > 0:
+            self.grouped_encoded_features = [
+                [self.feature_names.index(c) for c in group]
+                for group in encoded_list
+            ]
 
         return X
 
@@ -735,6 +738,8 @@ class IGANN:
 
         counter_no_progress = 0
         best_iter = 0
+        best_y_hat = y_hat  # vei: store best y_hat for ELM_IT
+        best_y_hat_val = y_hat_val
 
         # Sequentially fit one ELM after the other. Max number is stored in self.n_estimators.
         for counter in range(self.n_estimators):
@@ -786,9 +791,6 @@ class IGANN:
             self.boosting_rates.append(self.boost_rate)
             self.train_losses.append(train_loss.cpu())
             self.val_losses.append(val_loss.cpu())
-            # vei: store y_hat for ELM_IT
-            self.y_hats.append(y_hat)
-            self.y_hats_val.append(y_hat_val)
 
             # This is the early stopping mechanism. If there was no improvement on the
             # validation set, we increase a counter by 1. If there was an improvement,
@@ -798,6 +800,8 @@ class IGANN:
                 best_iter = counter + 1
                 best_loss = val_loss
                 counter_no_progress = 0
+                best_y_hat = y_hat  # vei: store best y_hat for ELM_IT
+                best_y_hat_val = y_hat_val
 
             if self.verbose >= 1:
                 self._print_results(
@@ -826,90 +830,91 @@ class IGANN:
                 print(f"Cutting at {best_iter}")
             self.regressors = self.regressors[:best_iter]
             self.boosting_rates = self.boosting_rates[:best_iter]
-            # vei: drop also y_hats
-            self.y_hats = self.y_hats[:best_iter]
-            self.y_hats_val = self.y_hats_val[:best_iter]
 
-        # vei: AB HIER ELM_IT
-        # update y_hat to prediction of best ELM iteration
-        y_hat = self.y_hats[-1]
-        y_hat_val = self.y_hats_val[-1]
-        y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
-                y, y_hat
-            )
-        # execute method to get the best feature combination
-        self.best_combination = self._find_interactions(X, y_tilde, self.interaction_detection_method)
+            # vei: AB HIER ELM_IT
+        if self.n_numerical_cols > 0 and self.n_categorical_cols > 0: # interaction term only possible if both numerical and categorical features are present
+            # update y_hat to prediction of best ELM iteration (or of initial model if no ELM was fitted)
+            y_hat = best_y_hat
+            y_hat_val = best_y_hat_val
+            if self.task == 'regression':
+                y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
+                        y, y_hat
+                    )
+            else:
+                y_tilde = y
+            # execute method to get the best feature combination
+            self.best_combination = self._find_interactions(X, y_tilde, self.interaction_detection_method)
 
-        # X dataset only for cat features
-        X_it = X[:, self.best_combination]
-        X_val_it = X_val[:, self.best_combination]
+            # X dataset only for cat features
+            X_it = X[:, self.best_combination]
+            X_val_it = X_val[:, self.best_combination]
 
-        # vei: store unique values of interaction features
-        self.unique_it = torch.unique(X_it, dim=0)
+            # vei: store unique values of interaction features
+            self.unique_it = torch.unique(X_it, dim=0)
 
-        counter_no_progress = 0
-        best_iter = 0
+            counter_no_progress = 0
+            best_iter = 0
 
-        # Sequentially fit one ELM for the Interaction pair after the other. Max number is stored in self.n_estimators.
-        for counter in range(self.n_estimators):
-            hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
-            y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
-                y, y_hat
-            )
-
-            # init ELM_IT Regressor
-            regressor = ELM_IT_Regressor(
-                best_combination = self.best_combination, 
-                n_hid = self.n_hid,
-                seed=counter,
-                elm_scale=self.elm_scale,
-                elm_alpha=self.elm_alpha,
-                act=self.act, 
-                device=self.device,
+            # Sequentially fit one ELM for the Interaction pair after another. Max number is stored in self.n_estimators.
+            for counter in range(self.n_estimators):
+                hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
+                y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
+                    y, y_hat
                 )
 
-            # Fit ELM regressor
-            X_hid = regressor.fit(
-                X_it, 
-                y_tilde,
-                torch.sqrt(torch.tensor(0.5).to(self.device))
-                * self.boost_rate
-                * hessian_train_sqrt[:, None],
-                )
+                # init ELM_IT Regressor
+                regressor = ELM_IT_Regressor(
+                    best_combination = self.best_combination, 
+                    n_hid = self.n_hid,
+                    seed=counter,
+                    elm_scale=self.elm_scale,
+                    elm_alpha=self.elm_alpha,
+                    act=self.act, 
+                    device=self.device,
+                    )
 
-            # Make a prediction of the ELM for the update of y_hat
-            train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
-            val_regressor_pred = regressor.predict(X_val_it).squeeze()
+                # Fit ELM regressor
+                X_hid = regressor.fit(
+                    X_it, 
+                    y_tilde,
+                    torch.sqrt(torch.tensor(0.5).to(self.device))
+                    * self.boost_rate
+                    * hessian_train_sqrt[:, None],
+                    )
 
-            self.regressor_predictions_it.append(train_regressor_pred)
+                # Make a prediction of the ELM for the update of y_hat
+                train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
+                val_regressor_pred = regressor.predict(X_val_it).squeeze()
 
-            # Update the prediction for training and validation data
-            y_hat += self.boost_rate * train_regressor_pred
-            y_hat_val += self.boost_rate * val_regressor_pred
+                self.regressor_predictions_it.append(train_regressor_pred)
 
-            y_hat = self._clip_p(y_hat)
-            y_hat_val = self._clip_p(y_hat_val)
+                # Update the prediction for training and validation data
+                y_hat += self.boost_rate * train_regressor_pred
+                y_hat_val += self.boost_rate * val_regressor_pred
 
-            train_loss = self.criterion(y_hat, y)
-            val_loss = self.criterion(y_hat_val, y_val)
+                y_hat = self._clip_p(y_hat)
+                y_hat_val = self._clip_p(y_hat_val)
 
-            # Keep the ELM, the boosting rate and losses in lists, so
-            # we can later use them again.
-            self.regressors_it.append(regressor)
-            self.boosting_rates_it.append(self.boost_rate)
-            self.train_losses_it.append(train_loss.cpu())
-            self.val_losses_it.append(val_loss.cpu())
+                train_loss = self.criterion(y_hat, y)
+                val_loss = self.criterion(y_hat_val, y_val)
 
-            # early stopping
-            counter_no_progress += 1
-            if val_loss < best_loss:
-                best_iter = counter + 1
-                best_loss = val_loss
-                counter_no_progress = 0
+                # Keep the ELM, the boosting rate and losses in lists, so
+                # we can later use them again.
+                self.regressors_it.append(regressor)
+                self.boosting_rates_it.append(self.boost_rate)
+                self.train_losses_it.append(train_loss.cpu())
+                self.val_losses_it.append(val_loss.cpu())
 
-            # Stop training if the counter for early stopping is greater than the parameter we passed.
-            if counter_no_progress > self.early_stopping and self.early_stopping > 0:
-                break
+                # early stopping
+                counter_no_progress += 1
+                if val_loss < best_loss:
+                    best_iter = counter + 1
+                    best_loss = val_loss
+                    counter_no_progress = 0
+
+                # Stop training if the counter for early stopping is greater than the parameter we passed.
+                if counter_no_progress > self.early_stopping and self.early_stopping > 0:
+                    break
 
         if self.early_stopping > 0:
             # We remove the ELMs that did not improve the performance. Most likely best_iter equals self.early_stopping.
@@ -930,18 +935,28 @@ class IGANN:
         numerical_features = list(range(self.n_numerical_cols))
         categorical_features = self.grouped_encoded_features
 
-        best_score = np.inf
+        best_score = np.inf if self.task == 'regression' else 0
         best_combination = None
 
         for num_var, cat_var in product(numerical_features, categorical_features):
             # Trainiere Modell mit den Variablen num_var und cat_var
             X_dt = X[:, [num_var] + cat_var]
-            tree = DecisionTreeRegressor(random_state=42, max_depth=3, criterion='squared_error')
+            if self.task == 'regression':
+                tree = DecisionTreeRegressor(random_state=42, max_depth=3, criterion='squared_error')
+            else: 
+                tree = DecisionTreeClassifier(random_state=42, max_depth=3, criterion='gini')
             tree.fit(X_dt, y_tilde)
-            score = mean_squared_error(y_tilde, tree.predict(X_dt))
+            y_pred = tree.predict(X_dt)
+
+            if self.task == 'regression':
+                score = mean_squared_error(y_tilde, y_pred)
+                is_better = score < best_score
+            else:
+                score = accuracy_score(y_tilde, y_pred)
+                is_better = score > best_score
 
             if len(set(tree.tree_.feature).difference([-2])) > 1: # only consider decistion tree with more than one feature
-                if score < best_score:
+                if is_better:
                     best_score = score
                     best_combination = [num_var] + cat_var
 
@@ -1158,6 +1173,161 @@ class IGANN:
         return best_combination
     
     # vei:
+    def _extract_rules_from_tree(self, tree):
+        rules = []
+
+        def _traverse(node_id=0, conditions=None):
+            if conditions is None:
+                conditions = []
+
+            # Check if the node is a leaf
+            if tree.children_left[node_id] == tree.children_right[node_id]:
+                support = tree.n_node_samples[node_id] / tree.n_node_samples[0]
+                if conditions:
+                    rules.append({'conditions': conditions, 'support': support})
+                return
+
+            # Get the feature and threshold for the current node
+            feature = tree.feature[node_id]
+            threshold = tree.threshold[node_id]
+
+            _traverse(tree.children_left[node_id], conditions + [(feature, '<=', threshold)])
+            _traverse(tree.children_right[node_id], conditions + [(feature, '>', threshold)])
+        
+        _traverse()
+        return rules
+    
+    # vei:
+    def _rule_activity_matrix(self, rules, X):
+        """
+        Binary Matrix indicating which rules are active for each observation in X.
+        """
+        n, m = X.shape[0], len(rules)
+        A = torch.ones((n, m), dtype=torch.bool, device=X.device)
+
+        for i, rule in enumerate(rules):
+            for feature, op, threshold in rule['conditions']:
+                if op == '<=':
+                    A[:, i] &= X[:, feature] <= threshold
+                else:
+                    A[:, i] &= X[:, feature] > threshold
+
+        A = A.cpu().numpy()
+        
+        return A.astype(float)
+    
+    # vei:
+    def _top_rulefit_interaction(
+            self, X, y_tilde,
+            tree_leaves=5,
+            n_trees=100,):
+        """
+        This function applies the RuleFit algorithm (Friedman and Popescu, 2008) to determine the most important combination of one 
+        categorical and one numberical feature.
+        """
+        # Fit ensemble of decision trees
+        if self.task == 'regression':
+            base_tree = DecisionTreeRegressor(random_state=self.random_state, max_leaf_nodes=tree_leaves)
+
+            bagger = BaggingRegressor(
+                estimator=base_tree,
+                n_estimators=n_trees,
+                max_samples=0.5,
+                bootstrap=True,
+                random_state=self.random_state,
+            )
+
+        else:
+            base_tree = DecisionTreeClassifier(random_state=self.random_state, max_leaf_nodes=tree_leaves)
+
+            bagger = BaggingClassifier(
+                estimator=base_tree,
+                n_estimators=n_trees,
+                max_samples=0.5,
+                bootstrap=True,
+                random_state=self.random_state,
+            )
+
+        bagger.fit(X, y_tilde)
+
+        # Extract rules from the decision trees
+        rules = []
+        for est in bagger.estimators_:
+            tree_rules =  self._extract_rules_from_tree(est.tree_)
+            rules.extend(tree_rules)
+
+        # Create a binary matrix indicating which rules are active for each observation in X
+        A = self._rule_activity_matrix(rules, X)
+        supports = np.array([r["support"] for r in rules])
+
+        scaler = StandardScaler(with_mean=False)
+        A_std = scaler.fit_transform(A)
+        
+        # L1-Regression to find the most important rules
+        if self.task == 'regression':
+            lasso = LassoCV(cv=5, random_state=self.random_state, n_jobs=-1, max_iter=5000)
+            lasso.fit(A_std, y_tilde)
+            coefs = lasso.coef_
+        else:
+            logreg = LogisticRegressionCV(penalty="l1", solver="liblinear", Cs=np.logspace(-4, 2, 15), cv=5, scoring='neg_log_loss', n_jobs=-1, max_iter=5000, random_state=self.random_state)
+            logreg.fit(A_std, y_tilde)
+            coefs = logreg.coef_.ravel_
+
+        # Rule Importance
+        importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
+        active_idx   = np.nonzero(importances)[0]  
+
+        # filter rules with only one numerical feature and one categorical feature
+        filtered_rules = defaultdict(float)
+        categorical_features = self.grouped_encoded_features
+        cat_feat2group = {
+            feat: gid
+            for gid, group in enumerate(self.grouped_encoded_features)
+            for feat in group
+        }
+
+        for i in active_idx:
+            rule = rules[i]
+            imp = importances[i]
+            num_feature = None
+            cat_group = None
+            valid = True
+
+            # extract features from the rule
+            for feat, _, _ in rule['conditions']:
+                if feat < self.n_numerical_cols:
+                    if num_feature is None:
+                        num_feature = feat
+                    else:
+                        valid = False
+                        break
+                else:
+                    g = cat_feat2group.get(feat)
+                    if cat_group is None:
+                        cat_group = g
+                    elif cat_group != g:
+                        valid = False
+                        break
+
+            if valid and num_feature is not None and cat_group is not None:
+                filtered_rules[(num_feature, cat_group)] += imp
+
+        if not filtered_rules:
+            print('No feature combination found. Model does not capture interactions. Try different feature interaction detection method.')
+            return None
+        
+        final_importances = defaultdict(float)
+        for key, value in filtered_rules.items():
+            final_importances[key] += value
+
+        best_key = max(final_importances, key=final_importances.get)
+        num_var, cat_var = best_key
+
+        best_combination = [num_var] + categorical_features[cat_var]
+
+        return best_combination
+    
+    # vei:
     def _find_interactions(self, X, y_tilde, method="dt"):
         """
         This function finds the most important interaction pair between a numerical and a categorical feature.
@@ -1171,6 +1341,8 @@ class IGANN:
             best_pair = self._constraint_dt(X, y_tilde)
         elif method == "FAST":
             best_pair = self._FAST_detection(X, y_tilde, n_bins=20)
+        elif method == "rulefit":
+            best_pair = self._top_rulefit_interaction(X, y_tilde)
         else:
             warnings.warn("Method not implemented. Use 'dt' or 'FAST'.")
 
@@ -1375,6 +1547,16 @@ class IGANN:
     # vei:
     def _get_pred_it(self):
         feat_values = self.unique_it
+
+        # create synthetic X values for the interaction pair to predict and plot the interaction effect
+        first_col_min = feat_values[:, 0].min().item()
+        first_col_max = feat_values[:, 0].max().item()
+        num_feat_values = torch.linspace(first_col_min, first_col_max, steps=300) # 300 values between min and max of the numerical feature
+        combinations = torch.cat([torch.zeros(1, len(self.best_combination)-1), torch.eye(len(self.best_combination)-1)], dim=0) # matrix with all values of the categorical feature
+        first_col_repeated = num_feat_values.repeat_interleave(len(self.best_combination)).unsqueeze(1) # repeat each value of num feature for each value of the cat feature
+        combinations_repeated = combinations.repeat(len(num_feat_values), 1) # repeat the cat feature values for each num feature value
+        feat_values = torch.cat([first_col_repeated, combinations_repeated], dim=1) # combine the num feature values with the cat feature values
+
         feat_values = feat_values.to(self.device)
         pred_it = torch.zeros(len(feat_values), dtype=torch.float32).to(self.device)
 
@@ -1476,25 +1658,34 @@ class IGANN:
         return shape_functions
     
     # vei:
-    def get_it_shape_functions_as_dict(self):
+    def get_it_shape_functions_as_dict(self, scaler, y_mean, y_std):
         # predict for each unique combination of the best interaction pair. unique combinations are stored in self.unique_it and get return by self._get_pred_it()
         feat_values, pred_it, pred = self._get_pred_it()
-        x_values = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
-        y_values = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
-        y_incl_univ = {f"category {i}": [] for i in range(1, feat_values.shape[1]+1)}
+
+        # scale values back to original values
+        x_mean = scaler.mean_[self.best_combination[0]]
+        x_std = scaler.scale_[self.best_combination[0]]
+        feat_values_unsc = feat_values.clone() # cloned to avoid changing the original tensor
+        feat_values_unsc[:, 0] = feat_values_unsc[:, 0] * x_std + x_mean
+        pred_it_unsc = pred_it * y_std + y_mean # cloned to avoid changing the original tensor
+        pred_unsc = pred * y_std + y_mean # cloned to avoid changing the original tensor
+
+        x_values = {f"category {i}": [] for i in range(1, feat_values_unsc.shape[1]+1)}
+        y_values = {f"category {i}": [] for i in range(1, feat_values_unsc.shape[1]+1)}
+        y_incl_univ = {f"category {i}": [] for i in range(1, feat_values_unsc.shape[1]+1)}
 
         # Iterate through rows and assign values to the corresponding column list
-        for row_idx, row in enumerate(feat_values):
+        for row_idx, row in enumerate(feat_values_unsc):
             if torch.all(row[1:] == 0):
                 x_values["category 1"].append(row[0].item())
-                y_values["category 1"].append(pred_it[row_idx].item())
-                y_incl_univ["category 1"].append(pred[row_idx].item())
+                y_values["category 1"].append(pred_it_unsc[row_idx].item())
+                y_incl_univ["category 1"].append(pred_unsc[row_idx].item())
             else:
-                for col_index in range(1, feat_values.shape[1]):  # Start checking from column 2
+                for col_index in range(1, feat_values_unsc.shape[1]):  # Start checking from column 2
                     if row[col_index] == 1:
                         x_values[f"category {col_index + 1}"].append(row[0].item())
-                        y_values[f"category {col_index + 1}"].append(pred_it[row_idx].item())
-                        y_incl_univ[f"category {col_index + 1}"].append(pred[row_idx].item())
+                        y_values[f"category {col_index + 1}"].append(pred_it_unsc[row_idx].item())
+                        y_incl_univ[f"category {col_index + 1}"].append(pred_unsc[row_idx].item())
                         break  # Stop after assigning the row to one column
 
         shape_functions = [
@@ -1699,13 +1890,13 @@ class IGANN:
         plt.show()
 
     # vei:
-    def plot_it(self, include_univariate=False):
+    def plot_it(self, scaler, y_mean, y_std, include_univariate=False):
         if include_univariate:
             y_values = "y_incl_univ"
         else:
             y_values = "y"
 
-        shape_functions = self.get_it_shape_functions_as_dict()
+        shape_functions = self.get_it_shape_functions_as_dict(scaler, y_mean, y_std)
         plt.close(fig="Shape functions")
 
         # Seaborn-Theme nur für diesen Plot aktivieren
@@ -1717,8 +1908,10 @@ class IGANN:
             
             sns.set_context("notebook", font_scale=1)
             
-            colors = sns.color_palette("rocket_r", n_colors=len(shape_functions))
-            fig, axs = plt.subplots(1, 1, figsize=(14, 6), num="Shape functions", constrained_layout=False, dpi=100) # dpi für Masterarbeit dann auf 2 bis 300 erhöhen
+            #colors = sns.color_palette("rocket_r", n_colors=len(shape_functions))
+            colors = ["#27AE60", "#7D3C98", "#E74C3C", "#2E86C1", "#F39C12"]
+
+            fig, axs = plt.subplots(1, 1, figsize=(8, 7), num="Shape functions", constrained_layout=False, dpi=100) # dpi für Masterarbeit dann auf 2 bis 300 erhöhen
             
             fig.patch.set_alpha(0)  # Transparenter Hintergrund für Figur
 
@@ -1735,25 +1928,38 @@ class IGANN:
 
                 axs.axhline(y=0, color="#404040", linestyle="-", linewidth=0.8, alpha=0.6)
 
-            axs.set_xlabel(self.feature_names[self.best_combination[0]], fontsize=14, labelpad=10, fontweight='semibold')
-            axs.set_ylabel("Contribution to Prediction $\\hat{y}$", fontsize=14, labelpad=10, fontweight='semibold')
-            axs.set_title(
-                f"Feature Interaction: Contribution of {self.feature_names[self.best_combination[0]]} and "
-                f"{self.feature_names[self.best_combination[-1]].split('_')[0]} to the Prediction",
-                fontsize=16, fontweight="bold", pad=15
-            )
+            #axs.set_xlabel(self.feature_names[self.best_combination[0]], fontsize=14, labelpad=10, fontweight='semibold')
+            axs.set_xlabel("Mileage (km)", fontsize=16, labelpad=10, fontweight='semibold')
+            axs.set_ylabel("Contribution to Prediction of Claim Cost           ", fontsize=16, labelpad=10, fontweight='semibold')
+            axs.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x)}€"))
+            axs.yaxis.grid(True, linestyle='-', alpha=0.8, color="gray")
+            axs.xaxis.grid(True, linestyle='--', alpha=0.8, color="gray")
+            if include_univariate:
+                axs.yaxis.set_major_locator(MultipleLocator(100))
+            else:
+                axs.yaxis.set_major_locator(MultipleLocator(50))
 
-            axs.tick_params(axis='x', labelrotation=45, labelsize=12)
-            axs.tick_params(axis='y', labelsize=12)
+            axs.xaxis.set_major_locator(MultipleLocator(25000))
+
+            axs.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+            #axs.set_title(f"Interaction Effect: Mileage x Car Type", fontsize=16, fontweight="bold", pad=15)
+
+            axs.tick_params(axis='x', labelrotation=45, labelsize=16)
+            axs.tick_params(axis='y', labelsize=16)
             axs.grid(visible=True, which='major', axis='both', linestyle='--', alpha=0.6)
-            axs.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=12, frameon=True, shadow=False, fancybox=True, borderpad=1)
+            #axs.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=12, frameon=True, shadow=False, fancybox=True, borderpad=1)
+            axs.legend(loc="upper center", bbox_to_anchor=(0.5, -0.3), ncol=2, fontsize=16, frameon=True)
+
             axs.spines["bottom"].set_color("#404040")  # Untere Linie dunkelgrau
             axs.spines["left"].set_color("#404040")    # Linke Linie dunkelgrau
             axs.spines["bottom"].set_linewidth(0.8)  # Untere Linie dicker machen
             axs.spines["left"].set_linewidth(0.8)    # Linke Linie dicker machen
             sns.despine(left=False, bottom=False)
-            plt.tight_layout(rect=[0, 0, 0.85, 0.95])  # Platz für Legende lassen
-            plt.subplots_adjust(right=0.8)  # Rechts mehr Platz für Legende
+            plt.tight_layout(rect=[0, 0.1, 1, 1])
+            #plt.tight_layout(rect=[0, 0, 0.85, 0.95])  # Platz für Legende lassen
+            #plt.subplots_adjust(right=0.8)  # Rechts mehr Platz für Legende
+            #plt.gca().set_facecolor('none')  # Hintergrund des Achsenbereichs transparent machen
+            plt.subplots_adjust(bottom=0.4)
             plt.show()
 
 
