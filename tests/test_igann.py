@@ -1,4 +1,4 @@
-from igann import igann
+from igann import igann_core
 import pandas as pd
 
 import matplotlib.pyplot as plt
@@ -35,7 +35,7 @@ def test_classification_train_no_interaction_pd_df():
     X_train = pd.DataFrame(X_train, columns=X_names)
     X_test = pd.DataFrame(X_test, columns=X_names)
 
-    model = igann.IGANN() # interactions=0)
+    model = igann_core.IGANN() # interactions=0)
 
     model.fit(X_train, y_train)
     preds = model.predict(X_test)
@@ -147,7 +147,7 @@ def test_classification_predict_proba_no_interaction_pd_df():
     X_train = pd.DataFrame(X_train, columns=X_names)
     X_test = pd.DataFrame(X_test, columns=X_names)
 
-    model = igann.IGANN() # interactions=0)
+    model = igann_core.IGANN() # interactions=0)
 
     model.fit(X_train, y_train)
     preds = model.predict_proba(X_test)
@@ -169,7 +169,7 @@ def test_classification_plot_single():
 
     X = pd.DataFrame(X, columns=X_names)
 
-    model = igann.IGANN() #interactions=0)
+    model = igann_core.IGANN() #interactions=0)
 
     model.fit(X, y)
 
@@ -203,7 +203,7 @@ def test_classification_plot_learning():
 
     X = pd.DataFrame(X, columns=X_names)
 
-    model = igann.IGANN() # interactions=2)
+    model = igann_core.IGANN() # interactions=2)
 
     model.fit(X, y)
     
@@ -232,7 +232,7 @@ def test_regression_train_no_interaction_pd_df():
         X_train = pd.DataFrame(X_train, columns=X_names)
         X_test = pd.DataFrame(X_test, columns=X_names)
 
-        model = igann.IGANN(task='regression') #, interactions=0)
+        model = igann_core.IGANN(task='regression') #, interactions=0)
 
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
@@ -318,7 +318,7 @@ def test_regression_plot_single():
     
     X = pd.DataFrame(X, columns=X_names)
 
-    model = igann.IGANN(task='regression') #, interactions=0)
+    model = igann_core.IGANN(task='regression') #, interactions=0)
 
     model.fit(X, y)
 
@@ -354,7 +354,7 @@ def test_regression_plot_learning():
     
     X = pd.DataFrame(X, columns=X_names)
 
-    model = igann.IGANN(task='regression') #, interactions=2)
+    model = igann_core.IGANN(task='regression') #, interactions=2)
 
     model.fit(X, y)
 
@@ -371,7 +371,7 @@ def test_classification_plot_single_w_baseline():
 
    X = pd.DataFrame(X, columns=X_names)
 
-   model = igann.IGANN(random_state=42) # interactions=0, 
+   model = igann_core.IGANN(random_state=42) # interactions=0, 
 
    model.fit(X, y)
 
@@ -497,7 +497,7 @@ def test_cat_variables():
     y = (y - y.mean()) / y.std()
     X = pd.DataFrame(X)
     X['cat_test'] = np.random.choice(['A', 'B', 'C', 'D'], X.shape[0], p=[0.2, 0.2, 0.1, 0.5])
-    m = igann.IGANN(task='regression', n_estimators=1000)
+    m = igann_core.IGANN(task='regression', n_estimators=1000)
     m.fit(pd.DataFrame(X), y)
     assert m.n_categorical_cols == 3
     assert m.n_numerical_cols == 10
@@ -507,13 +507,13 @@ def test_igann_dummies_for_cat_with_nans():
     y = (y - y.mean()) / y.std()
     X = pd.DataFrame(X)
     X['cat_test'] = np.random.choice(['A', 'B', 'C', 'D', np.nan], X.shape[0], p=[0.2, 0.2, 0.1, 0.3, 0.2])
-    m = igann.IGANN(task='regression', n_estimators=1000)
+    m = igann_core.IGANN(task='regression', n_estimators=1000)
     m.fit(pd.DataFrame(X), y)
     assert m.n_categorical_cols == 4
     assert m.n_numerical_cols == 10
     assert len(m.feature_names) == 14
     X['cat_test'] = np.random.choice(['A', 'B', 'C', np.nan], X.shape[0], p=[0.2, 0.2, 0.1, 0.5])
-    m = igann.IGANN(task='regression', n_estimators=1000)
+    m = igann_core.IGANN(task='regression', n_estimators=1000)
     m.fit(pd.DataFrame(X), y)
     assert m.n_categorical_cols == 3
     assert m.n_numerical_cols == 10
@@ -527,13 +527,13 @@ def test_torch_ridge():
                       [0.7738, 0.0795, 0.4846, 0.6665, 0.8383],
                       [0.2489, 0.8715, 0.3307, 0.0499, 0.5630]])
     y = torch.tensor([0.5545, 0.8965, 0.6915, 0.7395, 0.3370])
-    ridge = igann.torch_Ridge(alpha=0.0001, device=device)
+    ridge = igann_core.torch_Ridge(alpha=0.0001, device=device)
     ridge.fit(X,y)
     X_test = torch.tensor([0.2581, 0.6990, 0.3861, 0.6054, 0.8429])
     pred = ridge.predict(X_test)
     assert isinstance(pred.item(), float)
     assert (round(pred.item(), 4) == 1.0188)
-    ridge = igann.torch_Ridge(alpha=0.001, device=device)
+    ridge = igann_core.torch_Ridge(alpha=0.001, device=device)
     ridge.fit(X,y)
     pred = ridge.predict(X_test)
     assert (round(pred.item(), 4) == 0.9917)
@@ -550,7 +550,7 @@ def test_elm():
             [-1.4063,  0.7601, -1.5047, -0.0831,  0.0000,  0.0000,  1.0000,  0.0000,
             0.0000,  1.0000]])
     y = torch.tensor([-0.4383, -0.0506, -1.3534, -0.0438, -1.4075])
-    elm = igann.ELM_Regressor(X.shape[1], 6, X.shape[1], seed=0, elm_scale=10, 
+    elm = igann_core.ELM_Regressor(X.shape[1], 6, X.shape[1], seed=0, elm_scale=10, 
                  elm_alpha=0.0001, act='elu', device='cpu')
     elm.fit(X, y, torch.sqrt(torch.tensor(0.5) * 0.1 * 1))
     X_test = torch.tensor([[-1.3496,-1.0025, -1.3205, 0.7601, 1.0,  0.0,  0.0, 1.0, 0.0, 0.0]])
@@ -567,7 +567,7 @@ def test_igann_bagged():
     y_mean, y_std = y_train.mean(), y_train.std()
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
-    m = igann.IGANN_Bagged(task='regression', n_estimators=100, verbose=0, n_bags=5)
+    m = igann_core.IGANN_Bagged(task='regression', n_estimators=100, verbose=0, n_bags=5)
     m.fit(pd.DataFrame(X_train), y_train)
     m.plot_single(show_n=6, max_cat_plotted=4)
     pred = m.predict(X_test)
@@ -593,17 +593,17 @@ def test_parameters_n_hid():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.n_hid == 10) # If this fails, maybe the default value has changed
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].n_hid == 10) # If this fails, maybe the default value has changed
 
-    model = igann.IGANN(task='regression', n_hid=15)
+    model = igann_core.IGANN(task='regression', n_hid=15)
     assert (model.n_hid == 15)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].n_hid == 15)
 
-    model = igann.IGANN(task='regression', n_hid=5)
+    model = igann_core.IGANN(task='regression', n_hid=5)
     assert (model.n_hid == 5)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].n_hid == 5)
@@ -615,29 +615,29 @@ def test_parameters_n_estimators():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.n_estimators == 5000) # If this fails, maybe the default value has changed
     model.fit(pd.DataFrame(X_train), y_train)
     assert (len(model.regressors) <= 5000)
 
-    model = igann.IGANN(task='regression', n_estimators=10000)
+    model = igann_core.IGANN(task='regression', n_estimators=10000)
     assert (model.n_estimators == 10000)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (len(model.regressors) <= 10000)
 
-    model = igann.IGANN(task='regression', n_estimators=200)
+    model = igann_core.IGANN(task='regression', n_estimators=200)
     assert (model.n_estimators == 200)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (len(model.regressors) <= 200)
 
 def test_parameters_boost_rate():
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.boost_rate == .1) # If this fails, maybe the default value has changed
 
-    model = igann.IGANN(task='regression', boost_rate=0.3)
+    model = igann_core.IGANN(task='regression', boost_rate=0.3)
     assert (model.boost_rate == .3)
 
-    model = igann.IGANN(task='regression', boost_rate=0.01)
+    model = igann_core.IGANN(task='regression', boost_rate=0.01)
     assert (model.boost_rate == .01)
 
 def test_parameters_init_reg():
@@ -647,13 +647,13 @@ def test_parameters_init_reg():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.init_reg == 1) # If this fails, maybe the default value has changed
 
-    model = igann.IGANN(task='regression', init_reg=3)
+    model = igann_core.IGANN(task='regression', init_reg=3)
     assert (model.init_reg == 3)
 
-    model = igann.IGANN(task='regression', init_reg=0.1)
+    model = igann_core.IGANN(task='regression', init_reg=0.1)
     assert (model.init_reg == 0.1)
 
 def test_parameters_elm_scale():
@@ -663,17 +663,17 @@ def test_parameters_elm_scale():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.elm_scale == 1) # If this fails, maybe the default value has changed
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_scale == 1)
 
-    model = igann.IGANN(task='regression', elm_scale=3)
+    model = igann_core.IGANN(task='regression', elm_scale=3)
     assert (model.elm_scale == 3)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_scale == 3)
 
-    model = igann.IGANN(task='regression', elm_scale=0.1)
+    model = igann_core.IGANN(task='regression', elm_scale=0.1)
     assert (model.elm_scale == 0.1)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_scale == 0.1)
@@ -685,17 +685,17 @@ def test_parameters_elm_alpha():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.elm_alpha == 1) # If this fails, maybe the default value has changed
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_alpha == 1)
 
-    model = igann.IGANN(task='regression', elm_alpha=3)
+    model = igann_core.IGANN(task='regression', elm_alpha=3)
     assert (model.elm_alpha == 3)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_alpha == 3)
 
-    model = igann.IGANN(task='regression', elm_alpha=0.1)
+    model = igann_core.IGANN(task='regression', elm_alpha=0.1)
     assert (model.elm_alpha == 0.1)
     model.fit(pd.DataFrame(X_train), y_train)
     assert (model.regressors[0].elm_alpha == 0.1)
@@ -707,17 +707,17 @@ def test_parameters_act():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.act == "elu") # If this fails, maybe the default value has changed
     model.fit(pd.DataFrame(X_train), y_train)
     assert isinstance(model.regressors[0].act, torch.nn.ELU)
 
-    model = igann.IGANN(task='regression', act="relu")
+    model = igann_core.IGANN(task='regression', act="relu")
     assert (model.act == "relu")
     model.fit(pd.DataFrame(X_train), y_train)
     assert isinstance(model.regressors[0].act, torch.nn.ReLU)
 
-    model = igann.IGANN(task='regression', act=torch.nn.Tanh())
+    model = igann_core.IGANN(task='regression', act=torch.nn.Tanh())
     assert isinstance(model.act, torch.nn.Tanh)
     model.fit(pd.DataFrame(X_train), y_train)
     assert isinstance(model.regressors[0].act, torch.nn.Tanh)
@@ -729,11 +729,11 @@ def test_parameters_early_stopping():
     y_train = (y_train - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    model = igann.IGANN(task='regression')
+    model = igann_core.IGANN(task='regression')
     assert (model.early_stopping == 50) # If this fails, maybe the default value has changed
 
-    model = igann.IGANN(task='regression', early_stopping=20)
+    model = igann_core.IGANN(task='regression', early_stopping=20)
     assert (model.early_stopping == 20)
 
-    model = igann.IGANN(task='regression', early_stopping=100)
+    model = igann_core.IGANN(task='regression', early_stopping=100)
     assert (model.early_stopping == 100)

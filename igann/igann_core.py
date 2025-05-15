@@ -314,6 +314,7 @@ class IGANN:
         random_state=1,
         optimize_threshold=False,
         verbose=0,
+        igann_it=True,
         interaction_detection_method='dt',
     ):
         """
@@ -334,7 +335,7 @@ class IGANN:
         optimize_threshold: if True, the threshold for the classification is optimized using train data only and using the ROC curve. Otherwise, per default the raw logit value greater 0 means class 1 and less 0 means class -1.
         verbose: tells how much information should be printed when fitting. Can be 0 for (almost) no
         information, 1 for printing losses, and 2 for plotting shape functions in each iteration.
-        interaction_detection_method: method to detect interactions. Can be 'dt' or 'FAST'.
+        interaction_detection_method: method to detect interactions. Can be 'rulefit' or 'dt' or 'FAST'.
         """
         self.task = task
         self.n_hid = n_hid
@@ -349,6 +350,7 @@ class IGANN:
         self.random_state = random_state
         self.optimize_threshold = optimize_threshold
         self.verbose = verbose
+        self.igann_it = igann_it
         self.interaction_detection_method = interaction_detection_method
         ###### this is not needed since these are just for one run! ######
         # self.regressors = []
@@ -832,96 +834,95 @@ class IGANN:
             self.boosting_rates = self.boosting_rates[:best_iter]
 
             # vei: AB HIER ELM_IT
-        if self.n_numerical_cols > 0 and self.n_categorical_cols > 0: # interaction term only possible if both numerical and categorical features are present
-            # update y_hat to prediction of best ELM iteration (or of initial model if no ELM was fitted)
-            y_hat = best_y_hat
-            y_hat_val = best_y_hat_val
-            if self.task == 'regression':
+        if self.igann_it == True:
+            if self.n_numerical_cols > 0 and self.n_categorical_cols > 0: # interaction term only possible if both numerical and categorical features are present
+                # update y_hat to prediction of best ELM iteration (or of initial model if no ELM was fitted)
+                y_hat = best_y_hat
+                y_hat_val = best_y_hat_val
                 y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
                         y, y_hat
                     )
-            else:
-                y_tilde = y
-            # execute method to get the best feature combination
-            self.best_combination = self._find_interactions(X, y_tilde, self.interaction_detection_method)
+                # execute method to get the best feature combination
+                self.best_combination = self._find_interactions(X, y_tilde, self.interaction_detection_method)
 
-            # X dataset only for cat features
-            X_it = X[:, self.best_combination]
-            X_val_it = X_val[:, self.best_combination]
+                if self.igann_it == True:
+                    # X dataset only for cat features
+                    X_it = X[:, self.best_combination]
+                    X_val_it = X_val[:, self.best_combination]
 
-            # vei: store unique values of interaction features
-            self.unique_it = torch.unique(X_it, dim=0)
+                    # vei: store unique values of interaction features
+                    self.unique_it = torch.unique(X_it, dim=0)
 
-            counter_no_progress = 0
-            best_iter = 0
-
-            # Sequentially fit one ELM for the Interaction pair after another. Max number is stored in self.n_estimators.
-            for counter in range(self.n_estimators):
-                hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
-                y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
-                    y, y_hat
-                )
-
-                # init ELM_IT Regressor
-                regressor = ELM_IT_Regressor(
-                    best_combination = self.best_combination, 
-                    n_hid = self.n_hid,
-                    seed=counter,
-                    elm_scale=self.elm_scale,
-                    elm_alpha=self.elm_alpha,
-                    act=self.act, 
-                    device=self.device,
-                    )
-
-                # Fit ELM regressor
-                X_hid = regressor.fit(
-                    X_it, 
-                    y_tilde,
-                    torch.sqrt(torch.tensor(0.5).to(self.device))
-                    * self.boost_rate
-                    * hessian_train_sqrt[:, None],
-                    )
-
-                # Make a prediction of the ELM for the update of y_hat
-                train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
-                val_regressor_pred = regressor.predict(X_val_it).squeeze()
-
-                self.regressor_predictions_it.append(train_regressor_pred)
-
-                # Update the prediction for training and validation data
-                y_hat += self.boost_rate * train_regressor_pred
-                y_hat_val += self.boost_rate * val_regressor_pred
-
-                y_hat = self._clip_p(y_hat)
-                y_hat_val = self._clip_p(y_hat_val)
-
-                train_loss = self.criterion(y_hat, y)
-                val_loss = self.criterion(y_hat_val, y_val)
-
-                # Keep the ELM, the boosting rate and losses in lists, so
-                # we can later use them again.
-                self.regressors_it.append(regressor)
-                self.boosting_rates_it.append(self.boost_rate)
-                self.train_losses_it.append(train_loss.cpu())
-                self.val_losses_it.append(val_loss.cpu())
-
-                # early stopping
-                counter_no_progress += 1
-                if val_loss < best_loss:
-                    best_iter = counter + 1
-                    best_loss = val_loss
                     counter_no_progress = 0
+                    best_iter = 0
 
-                # Stop training if the counter for early stopping is greater than the parameter we passed.
-                if counter_no_progress > self.early_stopping and self.early_stopping > 0:
-                    break
+                    # Sequentially fit one ELM for the Interaction pair after another. Max number is stored in self.n_estimators.
+                    for counter in range(self.n_estimators):
+                        hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
+                        y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
+                            y, y_hat
+                        )
 
-        if self.early_stopping > 0:
-            # We remove the ELMs that did not improve the performance. Most likely best_iter equals self.early_stopping.
-            if self.verbose > 0:
-                print(f"Cutting at {best_iter}")
-            self.regressors_it = self.regressors_it[:best_iter]
-            self.boosting_rates_it = self.boosting_rates_it[:best_iter]
+                        # init ELM_IT Regressor
+                        regressor = ELM_IT_Regressor(
+                            best_combination = self.best_combination, 
+                            n_hid = self.n_hid,
+                            seed=counter,
+                            elm_scale=self.elm_scale,
+                            elm_alpha=self.elm_alpha,
+                            act=self.act, 
+                            device=self.device,
+                            )
+
+                        # Fit ELM regressor
+                        X_hid = regressor.fit(
+                            X_it, 
+                            y_tilde,
+                            torch.sqrt(torch.tensor(0.5).to(self.device))
+                            * self.boost_rate
+                            * hessian_train_sqrt[:, None],
+                            )
+
+                        # Make a prediction of the ELM for the update of y_hat
+                        train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
+                        val_regressor_pred = regressor.predict(X_val_it).squeeze()
+
+                        self.regressor_predictions_it.append(train_regressor_pred)
+
+                        # Update the prediction for training and validation data
+                        y_hat += self.boost_rate * train_regressor_pred
+                        y_hat_val += self.boost_rate * val_regressor_pred
+
+                        y_hat = self._clip_p(y_hat)
+                        y_hat_val = self._clip_p(y_hat_val)
+
+                        train_loss = self.criterion(y_hat, y)
+                        val_loss = self.criterion(y_hat_val, y_val)
+
+                        # Keep the ELM, the boosting rate and losses in lists, so
+                        # we can later use them again.
+                        self.regressors_it.append(regressor)
+                        self.boosting_rates_it.append(self.boost_rate)
+                        self.train_losses_it.append(train_loss.cpu())
+                        self.val_losses_it.append(val_loss.cpu())
+
+                        # early stopping
+                        counter_no_progress += 1
+                        if val_loss < best_loss:
+                            best_iter = counter + 1
+                            best_loss = val_loss
+                            counter_no_progress = 0
+
+                        # Stop training if the counter for early stopping is greater than the parameter we passed.
+                        if counter_no_progress > self.early_stopping and self.early_stopping > 0:
+                            break
+
+                if self.early_stopping > 0:
+                    # We remove the ELMs that did not improve the performance. Most likely best_iter equals self.early_stopping.
+                    if self.verbose > 0:
+                        print(f"Cutting at {best_iter}")
+                    self.regressors_it = self.regressors_it[:best_iter]
+                    self.boosting_rates_it = self.boosting_rates_it[:best_iter]
 
         return best_loss
 
@@ -1172,128 +1173,463 @@ class IGANN:
 
         return best_combination
     
-    # vei:
+    # # vei:
+    # def _extract_rules_from_tree(self, tree):
+    #     rules = []
+
+    #     def _traverse(node_id=0, conditions=None):
+    #         if conditions is None:
+    #             conditions = []
+
+    #         # Check if the node is a leaf
+    #         if tree.children_left[node_id] == tree.children_right[node_id]:
+    #             support = tree.n_node_samples[node_id] / tree.n_node_samples[0]
+    #             if conditions:
+    #                 rules.append({'conditions': conditions, 'support': support})
+    #             return
+
+    #         # Get the feature and threshold for the current node
+    #         feature = tree.feature[node_id]
+    #         threshold = tree.threshold[node_id]
+
+    #         _traverse(tree.children_left[node_id], conditions + [(feature, '<=', threshold)])
+    #         _traverse(tree.children_right[node_id], conditions + [(feature, '>', threshold)])
+        
+    #     _traverse()
+    #     return rules
+
+    # # vei:
+    # def filter_valid_rules(self, rules):
+    #     """
+    #     Filters rules to only keep those that involve exactly:
+    #     - One numerical feature
+    #     - One categorical feature group (which can map to multiple one-hot features)
+    #     """
+    #     filtered_rules = []
+    #     categorical_features = self.grouped_encoded_features
+    #     cat_feat2group = {
+    #         feat: gid
+    #         for gid, group in enumerate(categorical_features)
+    #         for feat in group
+    #     }
+
+    #     for rule in rules:
+    #         num_feature = None
+    #         cat_group = None
+    #         valid = True
+
+    #         for feat, _, _ in rule['conditions']:
+    #             if feat < self.n_numerical_cols:
+    #                 if num_feature is None:
+    #                     num_feature = feat
+    #                 else:
+    #                     valid = False
+    #                     break
+    #             else:
+    #                 g = cat_feat2group.get(feat)
+    #                 if g is None:
+    #                     valid = False
+    #                     break
+    #                 if cat_group is None:
+    #                     cat_group = g
+    #                 elif cat_group != g:
+    #                     valid = False
+    #                     break
+
+    #         if valid and num_feature is not None and cat_group is not None:
+    #             filtered_rules.append(rule)
+
+    #     return filtered_rules
+
+    
+    # # vei:
+    # def _rule_activity_matrix(self, rules, X):
+    #     """
+    #     Binary Matrix indicating which rules are active for each observation in X.
+    #     """
+    #     n, m = X.shape[0], len(rules)
+    #     A = torch.ones((n, m), dtype=torch.bool, device=X.device)
+
+    #     for i, rule in enumerate(rules):
+    #         for feature, op, threshold in rule['conditions']:
+    #             if op == '<=':
+    #                 A[:, i] &= X[:, feature] <= threshold
+    #             else:
+    #                 A[:, i] &= X[:, feature] > threshold
+
+    #     A = A.cpu().numpy()
+        
+    #     return A.astype(float)
+    
+    # # vei:
+    # def _top_rulefit_interaction(
+    #         self, X, y_tilde,
+    #         tree_leaves=5,
+    #         n_trees=100,):
+    #     """
+    #     This function applies the RuleFit algorithm (Friedman and Popescu, 2008) to determine the most important combination of one 
+    #     categorical and one numberical feature.
+    #     """
+    #     # Fit ensemble of decision trees
+    #     if self.task == 'regression':
+    #         base_tree = DecisionTreeRegressor(random_state=self.random_state, max_leaf_nodes=tree_leaves)
+
+    #         bagger = BaggingRegressor(
+    #             estimator=base_tree,
+    #             n_estimators=n_trees,
+    #             max_samples=0.5,
+    #             bootstrap=True,
+    #             random_state=self.random_state,
+    #         )
+
+    #     else:
+    #         base_tree = DecisionTreeClassifier(random_state=self.random_state, max_leaf_nodes=tree_leaves)
+
+    #         bagger = BaggingClassifier(
+    #             estimator=base_tree,
+    #             n_estimators=n_trees,
+    #             max_samples=0.5,
+    #             bootstrap=True,
+    #             random_state=self.random_state,
+    #         )
+
+    #     bagger.fit(X, y_tilde)
+
+    #     # Extract rules from the decision trees
+    #     rules = []
+    #     for est in bagger.estimators_:
+    #         tree_rules =  self._extract_rules_from_tree(est.tree_)
+    #         rules.extend(tree_rules)
+
+    #     filtered_rules = self.filter_valid_rules(rules)
+    #     A = self._rule_activity_matrix(filtered_rules, X)
+    #     supports = np.array([r["support"] for r in filtered_rules])
+
+    #     # Create a binary matrix indicating which rules are active for each observation in X
+    #     #A = self._rule_activity_matrix(rules, X)
+    #     #supports = np.array([r["support"] for r in rules])
+
+    #     scaler = StandardScaler(with_mean=False)
+    #     A_std = scaler.fit_transform(A)
+    #     # L1-Regression to find the most important rules
+    #     if self.task == 'regression':
+    #         lasso = LassoCV(cv=5, random_state=self.random_state, n_jobs=-1, max_iter=10000)
+    #         lasso.fit(A_std, y_tilde)
+    #         coefs = lasso.coef_
+    #     else:
+    #         logreg = LogisticRegressionCV(penalty="l1", solver="liblinear", Cs=np.logspace(-4, 2, 15), cv=5, scoring='neg_log_loss', n_jobs=-1, max_iter=5000, random_state=self.random_state)
+    #         logreg.fit(A_std, y_tilde)
+    #         coefs = logreg.coef_.ravel_
+
+    #     # Rule Importance
+    #     importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
+    #     active_idx   = np.nonzero(importances)[0]  
+
+    #     # # filter rules with only one numerical feature and one categorical feature
+    #     # filtered_rules = defaultdict(float)
+    #     # categorical_features = self.grouped_encoded_features
+    #     # cat_feat2group = {
+    #     #     feat: gid
+    #     #     for gid, group in enumerate(self.grouped_encoded_features)
+    #     #     for feat in group
+    #     # }
+
+    #     # for i in active_idx:
+    #     #     rule = rules[i]
+    #     #     imp = importances[i]
+    #     #     num_feature = None
+    #     #     cat_group = None
+    #     #     valid = True
+
+    #     #     # extract features from the rule
+    #     #     for feat, _, _ in rule['conditions']:
+    #     #         if feat < self.n_numerical_cols:
+    #     #             if num_feature is None:
+    #     #                 num_feature = feat
+    #     #             else:
+    #     #                 valid = False
+    #     #                 break
+    #     #         else:
+    #     #             g = cat_feat2group.get(feat)
+    #     #             if cat_group is None:
+    #     #                 cat_group = g
+    #     #             elif cat_group != g:
+    #     #                 valid = False
+    #     #                 break
+
+    #     #     if valid and num_feature is not None and cat_group is not None:
+    #     #         filtered_rules[(num_feature, cat_group)] += imp
+
+    #     # if not filtered_rules:
+    #     #     print('No feature combination found. Model does not capture interactions. Try different feature interaction detection method.')
+    #     #     self.igann_it = False
+
+    #     #     return None
+        
+    #     # final_importances = defaultdict(float)
+    #     # for key, value in filtered_rules.items():
+    #     #     final_importances[key] += value
+
+    #     # best_key = max(final_importances, key=final_importances.get)
+    #     # num_var, cat_var = best_key
+
+    #     # best_combination = [num_var] + categorical_features[cat_var]
+
+    #     # return best_combination
+    #     # Aufbau: Mapping von (num_feat, cat_group) → Importance
+
+    #     final_importances = defaultdict(float)
+    #     cat_feat2group = {
+    #         feat: gid
+    #         for gid, group in enumerate(self.grouped_encoded_features)
+    #         for feat in group
+    #     }
+
+    #     for i in active_idx:
+    #         rule = filtered_rules[i]
+    #         imp = importances[i]
+    #         num_feature = None
+    #         cat_group = None
+    #         valid = True
+
+    #         for feat, _, _ in rule['conditions']:
+    #             if feat < self.n_numerical_cols:
+    #                 if num_feature is None:
+    #                     num_feature = feat
+    #                 else:
+    #                     valid = False
+    #                     break
+    #             else:
+    #                 g = cat_feat2group.get(feat)
+    #                 if cat_group is None:
+    #                     cat_group = g
+    #                 elif cat_group != g:
+    #                     valid = False
+    #                     break
+
+    #         if valid and num_feature is not None and cat_group is not None:
+    #             final_importances[(num_feature, cat_group)] += imp
+
+    #     # Best Combination bestimmen
+    #     best_key = max(final_importances, key=final_importances.get)
+    #     num_var, cat_group = best_key
+    #     best_combination = [num_var] + self.grouped_encoded_features[cat_group]
+
+    #     return best_combination
+
+
+    # ---------------------------------------------------------------------------
+    # 1) Regeln aus Entscheidungsbaum extrahieren
+    # ---------------------------------------------------------------------------
     def _extract_rules_from_tree(self, tree):
+        """Tiefensuche durch den Baum und Sammeln aller Blatt-Regeln."""
         rules = []
 
         def _traverse(node_id=0, conditions=None):
             if conditions is None:
                 conditions = []
 
-            # Check if the node is a leaf
+            # Blatt?
             if tree.children_left[node_id] == tree.children_right[node_id]:
                 support = tree.n_node_samples[node_id] / tree.n_node_samples[0]
-                if conditions:
+                if conditions:                   # leere Regel ignorieren
                     rules.append({'conditions': conditions, 'support': support})
                 return
 
-            # Get the feature and threshold for the current node
-            feature = tree.feature[node_id]
+            feature   = tree.feature[node_id]
             threshold = tree.threshold[node_id]
 
-            _traverse(tree.children_left[node_id], conditions + [(feature, '<=', threshold)])
-            _traverse(tree.children_right[node_id], conditions + [(feature, '>', threshold)])
-        
+            _traverse(tree.children_left[node_id],
+                    conditions + [(feature, '<=', threshold)])
+            _traverse(tree.children_right[node_id],
+                    conditions + [(feature, '>',  threshold)])
+
         _traverse()
         return rules
-    
-    # vei:
-    def _rule_activity_matrix(self, rules, X):
+    # ---------------------------------------------------------------------------
+
+
+    # ---------------------------------------------------------------------------
+    # 2) Gültige Regeln (1 num + 1 cat-Gruppe) filtern
+    # ---------------------------------------------------------------------------
+    def filter_valid_rules(self, rules):
         """
-        Binary Matrix indicating which rules are active for each observation in X.
+        Behalte nur Regeln, die genau
+        • ein numerisches Feature und
+        • eine (ggf. mehrere one-hot-Spalten umfassende) kategoriale Gruppe
+        enthalten.
         """
-        n, m = X.shape[0], len(rules)
-        A = torch.ones((n, m), dtype=torch.bool, device=X.device)
-
-        for i, rule in enumerate(rules):
-            for feature, op, threshold in rule['conditions']:
-                if op == '<=':
-                    A[:, i] &= X[:, feature] <= threshold
-                else:
-                    A[:, i] &= X[:, feature] > threshold
-
-        A = A.cpu().numpy()
-        
-        return A.astype(float)
-    
-    # vei:
-    def _top_rulefit_interaction(
-            self, X, y_tilde,
-            tree_leaves=5,
-            n_trees=100,):
-        """
-        This function applies the RuleFit algorithm (Friedman and Popescu, 2008) to determine the most important combination of one 
-        categorical and one numberical feature.
-        """
-        # Fit ensemble of decision trees
-        if self.task == 'regression':
-            base_tree = DecisionTreeRegressor(random_state=self.random_state, max_leaf_nodes=tree_leaves)
-
-            bagger = BaggingRegressor(
-                estimator=base_tree,
-                n_estimators=n_trees,
-                max_samples=0.5,
-                bootstrap=True,
-                random_state=self.random_state,
-            )
-
-        else:
-            base_tree = DecisionTreeClassifier(random_state=self.random_state, max_leaf_nodes=tree_leaves)
-
-            bagger = BaggingClassifier(
-                estimator=base_tree,
-                n_estimators=n_trees,
-                max_samples=0.5,
-                bootstrap=True,
-                random_state=self.random_state,
-            )
-
-        bagger.fit(X, y_tilde)
-
-        # Extract rules from the decision trees
-        rules = []
-        for est in bagger.estimators_:
-            tree_rules =  self._extract_rules_from_tree(est.tree_)
-            rules.extend(tree_rules)
-
-        # Create a binary matrix indicating which rules are active for each observation in X
-        A = self._rule_activity_matrix(rules, X)
-        supports = np.array([r["support"] for r in rules])
-
-        scaler = StandardScaler(with_mean=False)
-        A_std = scaler.fit_transform(A)
-        
-        # L1-Regression to find the most important rules
-        if self.task == 'regression':
-            lasso = LassoCV(cv=5, random_state=self.random_state, n_jobs=-1, max_iter=5000)
-            lasso.fit(A_std, y_tilde)
-            coefs = lasso.coef_
-        else:
-            logreg = LogisticRegressionCV(penalty="l1", solver="liblinear", Cs=np.logspace(-4, 2, 15), cv=5, scoring='neg_log_loss', n_jobs=-1, max_iter=5000, random_state=self.random_state)
-            logreg.fit(A_std, y_tilde)
-            coefs = logreg.coef_.ravel_
-
-        # Rule Importance
-        importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
-        active_idx   = np.nonzero(importances)[0]  
-
-        # filter rules with only one numerical feature and one categorical feature
-        filtered_rules = defaultdict(float)
-        categorical_features = self.grouped_encoded_features
+        filtered = []
         cat_feat2group = {
             feat: gid
             for gid, group in enumerate(self.grouped_encoded_features)
             for feat in group
         }
 
-        for i in active_idx:
-            rule = rules[i]
-            imp = importances[i]
+        for rule in rules:
             num_feature = None
-            cat_group = None
-            valid = True
+            cat_group   = None
+            valid       = True
 
-            # extract features from the rule
+            for feat, _, _ in rule['conditions']:
+                if feat < self.n_numerical_cols:          # numerisch
+                    if num_feature is None:
+                        num_feature = feat
+                    else:                                 # zwei numerische ⇒ raus
+                        valid = False
+                        break
+                else:                                     # kategoriale OHE-Spalte
+                    g = cat_feat2group.get(feat)
+                    if g is None:
+                        valid = False
+                        break
+                    if cat_group is None:
+                        cat_group = g
+                    elif cat_group != g:                  # zwei Gruppen ⇒ raus
+                        valid = False
+                        break
+
+            if valid and num_feature is not None and cat_group is not None:
+                filtered.append(rule)
+
+        return filtered
+    # ---------------------------------------------------------------------------
+
+
+    # ---------------------------------------------------------------------------
+    # 3) Aktivitätsmatrix
+    # ---------------------------------------------------------------------------
+    def _rule_activity_matrix(self, rules, X):
+        """
+        Gibt eine (n × m)-Matrix zurück (float), in der A[i,j]=1, falls
+        Regel j für Beobachtung i aktiv ist. Bei leerer Regelliste wird
+        eine Matrix mit 0 Spalten zurückgegeben.
+        """
+        n = X.shape[0]
+        m = len(rules)
+        if m == 0:
+            return np.empty((n, 0), dtype=float)
+
+        A = torch.ones((n, m), dtype=torch.bool, device=X.device)
+        for j, rule in enumerate(rules):
+            for feature, op, thresh in rule['conditions']:
+                if op == '<=':
+                    A[:, j] &= X[:, feature] <= thresh
+                else:
+                    A[:, j] &= X[:, feature] >  thresh
+        return A.cpu().numpy().astype(float)
+    # ---------------------------------------------------------------------------
+
+
+    # ---------------------------------------------------------------------------
+    # 4) Wichtigste 1×1-Interaktion via RuleFit-Importances
+    # ---------------------------------------------------------------------------
+    def _top_rulefit_interaction(
+            self, X, y_tilde,
+            tree_leaves=5,
+            n_trees=100):
+        """
+        Liefert die feature-Indices der wichtigsten Interaktion
+        [num_feature] + list(categorical_ohe_indices)
+        oder None, falls keine gültige Regel vorhanden ist.
+        """
+
+        # --------------------------------------------------
+        # 4.1 Ensemble trainieren
+        # --------------------------------------------------
+        #if self.task == 'regression':
+        base_tree = DecisionTreeRegressor(
+            random_state=self.random_state,
+            max_leaf_nodes=tree_leaves)
+        bagger = BaggingRegressor(
+            estimator=base_tree,
+            n_estimators=n_trees,
+            max_samples=0.5,
+            bootstrap=True,
+            random_state=self.random_state)
+        # else:
+        #     base_tree = DecisionTreeClassifier(
+        #         random_state=self.random_state,
+        #         max_leaf_nodes=tree_leaves)
+        #     bagger = BaggingClassifier(
+        #         estimator=base_tree,
+        #         n_estimators=n_trees,
+        #         max_samples=0.5,
+        #         bootstrap=True,
+        #         random_state=self.random_state)
+
+        bagger.fit(X, y_tilde)
+
+        # --------------------------------------------------
+        # 4.2 Regeln extrahieren & filtern
+        # --------------------------------------------------
+        rules = []
+        for est in bagger.estimators_:
+            rules.extend(self._extract_rules_from_tree(est.tree_))
+
+        filtered_rules = self.filter_valid_rules(rules)
+        if len(filtered_rules) == 0:                 # ← kein Kandidat
+            self.igann_it = False
+            return None
+
+        # --------------------------------------------------
+        # 4.3 Aktivitätsmatrix & Support
+        # --------------------------------------------------
+        A         = self._rule_activity_matrix(filtered_rules, X)
+        supports  = np.array([r['support'] for r in filtered_rules])
+
+        # --------------------------------------------------
+        # 4.4 L1-Modell (Lasso / L1-LogReg)
+        # --------------------------------------------------
+        scaler = StandardScaler(with_mean=False)
+        A_std  = scaler.fit_transform(A)
+
+        if A_std.shape[1] == 0:                     # sollte hier nie passieren,
+            self.igann_it = False                   # da len(filtered_rules) > 0,
+            return None                             # aber zur Sicherheit.
+
+        #if self.task == 'regression':
+        lasso = LassoCV(cv=5,
+                        random_state=self.random_state,
+                        n_jobs=-1,
+                        max_iter=10_000)
+        lasso.fit(A_std, y_tilde)
+        coefs = lasso.coef_
+
+        # else:
+        #     logreg = LogisticRegressionCV(
+        #         penalty='l1',
+        #         solver='liblinear',
+        #         Cs=np.logspace(-4, 2, 15),
+        #         cv=5,
+        #         scoring='neg_log_loss',
+        #         n_jobs=-1,
+        #         max_iter=5_000,
+        #         random_state=self.random_state)
+        #     logreg.fit(A_std, y_tilde)
+        #     coefs = logreg.coef_.ravel_
+
+        # --------------------------------------------------
+        # 4.5 Rule-Importances & Mapping auf (num, cat_group)
+        # --------------------------------------------------
+        importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
+        active_idx  = np.nonzero(importances)[0]
+
+        final_imps  = defaultdict(float)
+        cat_feat2group = {
+            feat: gid
+            for gid, grp in enumerate(self.grouped_encoded_features)
+            for feat in grp
+        }
+
+        for i in active_idx:
+            rule = filtered_rules[i]
+            imp  = importances[i]
+
+            num_feature = None
+            cat_group   = None
+            valid       = True
+
             for feat, _, _ in rule['conditions']:
                 if feat < self.n_numerical_cols:
                     if num_feature is None:
@@ -1310,22 +1646,22 @@ class IGANN:
                         break
 
             if valid and num_feature is not None and cat_group is not None:
-                filtered_rules[(num_feature, cat_group)] += imp
+                final_imps[(num_feature, cat_group)] += imp
 
-        if not filtered_rules:
+        # --------------------------------------------------
+        # 4.6 Beste Interaktion bestimmen
+        # --------------------------------------------------
+        if len(final_imps) == 0:
             print('No feature combination found. Model does not capture interactions. Try different feature interaction detection method.')
+            self.igann_it = False
             return None
-        
-        final_importances = defaultdict(float)
-        for key, value in filtered_rules.items():
-            final_importances[key] += value
 
-        best_key = max(final_importances, key=final_importances.get)
-        num_var, cat_var = best_key
+        best_key        = max(final_imps, key=final_imps.get)
+        num_var, cat_g  = best_key
+        best_comb       = [num_var] + self.grouped_encoded_features[cat_g]
 
-        best_combination = [num_var] + categorical_features[cat_var]
+        return best_comb
 
-        return best_combination
     
     # vei:
     def _find_interactions(self, X, y_tilde, method="dt"):
@@ -1344,7 +1680,7 @@ class IGANN:
         elif method == "rulefit":
             best_pair = self._top_rulefit_interaction(X, y_tilde)
         else:
-            warnings.warn("Method not implemented. Use 'dt' or 'FAST'.")
+            warnings.warn("Method not implemented. Use 'dt' or 'FAST' or 'rulefit.")
 
         return best_pair
 
@@ -1511,6 +1847,11 @@ class IGANN:
         pred_nn = torch.zeros(len(X), dtype=torch.float32).to(self.device)
         for boost_rate, regressor in zip(self.boosting_rates, self.regressors):
             pred_nn += boost_rate * regressor.predict(X).squeeze()
+        # vei:
+        if self.igann_it == True:
+            for boost_rate, regressor in zip(self.boosting_rates_it, self.regressors_it):
+                pred_nn += boost_rate * regressor.predict(X[:, self.best_combination]).squeeze()
+
         pred_nn = pred_nn.detach().cpu().numpy()
         X = X.detach().cpu().numpy()
         pred = (
