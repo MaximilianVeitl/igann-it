@@ -1,12 +1,3 @@
-- IGANN was renamed to igann_core only because of naming conflicts during the development process. It's like the original IGANN file, but includes IT.
-
-Files:
-- igann_core ist igann-it model
-- igann_core all changes are marked with # Veitl:
-- demo_igann_it is demo of IGANNIT on car insurance use case
-- Evaluation_final is evaluation of IGANN-IT model on 12 datasets
-- Survey_evaluation_final is evaluation of experimental study
-
 # IGANN-IT Model
 
 This project builds on the original **IGANN model** by *Mathias Kraus* ([GitHub Repository](https://github.com/MathiasKraus/igann)).  
