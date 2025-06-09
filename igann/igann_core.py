@@ -5,7 +5,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, Lasso, LassoCV
+from sklearn.linear_model import LogisticRegression, Lasso, LassoCV
 from sklearn.metrics import roc_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
@@ -20,14 +20,12 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
 )
-# vei:
-from sklearn.ensemble import BaggingRegressor, BaggingClassifier
+# Veitl: added imports for interaction modeling
+from sklearn.ensemble import BaggingRegressor
 from sklearn.preprocessing import StandardScaler
 from itertools import product, combinations
-import plotly.graph_objects as go
-import plotly.express as px
 import matplotlib.ticker as mticker
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import AutoLocator
 from collections import defaultdict
 
 
@@ -200,8 +198,16 @@ class ELM_Regressor:
             out = x_in @ self.output_model.coef_[start_idx : start_idx + 1].unsqueeze(1)
         return out
 
-    # vei: added this function to predict the output of a feature pair
+    # Veitl: added function for feature interaction
     def predict_it(self, X, int_pair):
+        """
+        This function predicts the main effects of the selected feature interaction (numerical and categorical feature).
+
+        X: matrix representing the unique values of feature combinations;
+            first column = numerical feature values, other columns = encoded categorical feature values
+        int_pair: encoded feature pair (numerical_idx, categorical_idx)
+        
+        """
         num_idx = [int_pair[0] * self.n_hid + i for i in range(self.n_hid)]
         cat_idx = [i - self.n_numerical_cols + (self.n_numerical_cols * self.n_hid) for i in int_pair[1:]]
         coef_idx = num_idx + cat_idx
@@ -224,7 +230,24 @@ class ELM_Regressor:
         self.output_model = m
         return X_hid
 
+# Veitl: added ELM_IT_Regressor for interaction modeling
 class ELM_IT_Regressor:
+    """
+    This class represents an ELM (Extreme Learning Machine) model for modeling interactions 
+    between one numerical feature and one categorical feature. 
+    
+    The architecture is based on a single hidden layer neural network. 
+    The weights of the hidden layer are randomly initialized and not trained, 
+    which reduces the training task to a Ridge Regression. 
+    
+    The interaction between the selected feature pair is modeled by using the one-hot 
+    encoded categorical feature as a router, selecting and activating the corresponding 
+    category-specific sub-network. The activated sub-network processes the numerical 
+    input through the hidden layer and the output layer.
+    
+    This allows the model to capture non-linear interaction effects between feature pairs.
+    """
+
     def __init__(
         self, 
         best_combination, 
@@ -236,7 +259,17 @@ class ELM_IT_Regressor:
         device="cpu",
     ):
         """
-        hier kommt noch die Beschreibung rein
+        Input parameters:
+        - best_combination: list of feature indices representing the selected interaction pair 
+                            (one numerical feature index and one or more encoded categorical feature indices).
+        - n_hid: number of hidden neurons per category-specific sub-network.
+        - seed: This number sets the seed for generating the random weights. It should
+                be different for each regressor
+        - elm_scale: the scale which is used to initialize the weights in the hidden layer of the
+                 model. These weights are not changed throughout the optimization.
+        - elm_alpha: the regularization of the ridge regression.
+        - act: the activation function in the model. can be 'elu', 'relu' or a torch activation function.
+        - device: the device on which the regressor should train. can be 'cpu' or 'cuda'.
         """
         super().__init__()
         np.random.seed(seed)
@@ -261,6 +294,11 @@ class ELM_IT_Regressor:
             self.act = act
 
     def get_hidden_values(self, X):
+        """
+        Computes the hidden layer values for the interaction input X.
+        The categorical feature is used to activate the corresponding sub-network.
+        The numerical feature is multiplied with the active neurons.
+        """
         X_num_feature = X[:, 0]
         X_cat_feature = torch.hstack((X[:, 1:], 1 ^ X[:, 1:].sum(dim=1).unsqueeze(1).int())) # add new column to restore first category (was dropped in encoding step)
         X_comb_feature = X_num_feature.unsqueeze(1) * X_cat_feature
@@ -271,6 +309,11 @@ class ELM_IT_Regressor:
     
     def predict(self, X, hidden=False):
         """
+        Predicts the output of the ELM_IT for the selected feature interaction.
+        
+        Input:
+        - X: input matrix for the selected feature interaction
+        - hidden: if True, X is already the hidden layer output
         """
         if hidden:
             X_hid = X
@@ -281,6 +324,14 @@ class ELM_IT_Regressor:
         return out
 
     def fit(self, X, y, mult_coef):
+        """
+        Fits the ELM_IT to the selected feature interaction.
+        
+        Input:
+        - X: input matrix with values for the selected feature interaction
+        - y: target values
+        - mult_coef: scaling factors for the hidden layer output, usually coming from the boosting procedure.
+        """
         X_hid = self.get_hidden_values(X)
         X_hid_mult = X_hid * mult_coef
         m = torch_Ridge(alpha=self.elm_alpha, device=self.device)
@@ -335,7 +386,8 @@ class IGANN:
         optimize_threshold: if True, the threshold for the classification is optimized using train data only and using the ROC curve. Otherwise, per default the raw logit value greater 0 means class 1 and less 0 means class -1.
         verbose: tells how much information should be printed when fitting. Can be 0 for (almost) no
         information, 1 for printing losses, and 2 for plotting shape functions in each iteration.
-        interaction_detection_method: method to detect interactions. Can be 'rulefit' or 'dt' or 'FAST'.
+        igann_it: if True the model will use the interaction modeling extension of IGANN. # Veitl: added
+        interaction_detection_method: method to detect interactions. Can be 'rulefit' or 'dt' or 'FAST'. # Veitl: added
         """
         self.task = task
         self.n_hid = n_hid
@@ -423,15 +475,15 @@ class IGANN:
         self.val_losses = []
         self.test_losses = []
         self.regressor_predictions = []
-        # vei: store regressors_it separately
+        # Veitl: store regressors_it separately
         self.regressors_it = []
-        # vei: store boosting rates for regressors_it
+        # Veitl: store boosting rates for regressors_it
         self.boosting_rates_it = []
-        # vei: store train losses for regressors_it
+        # Veitl: store train losses for regressors_it
         self.train_losses_it = []
-        # vei: store val losses for regressors_it
+        # Veitl: store val losses for regressors_it
         self.val_losses_it = []
-        # vei: store regressor_it predictions separately
+        # Veitl: store regressor_it predictions separately
         self.regressor_predictions_it = []
 
     def _preprocess_feature_matrix(self, X, fit_dummies=False):
@@ -454,7 +506,7 @@ class IGANN:
         else:
             self.n_numerical_cols = 0
         
-        #vei: store dropped categories
+        # Veitl: list to collect dropped first categories from one-hot encoding
         self.dropped_categories = {}
 
         if len(categorical_cols) > 0:
@@ -475,7 +527,7 @@ class IGANN:
                 zip(self._flatten(encoded_list), self._flatten(original_list))
             )
             
-            # vei: store dropped categories
+            # Veitl: store the dropped first category for each categorical feature (was removed during one-hot encoding)
             for col in categorical_cols:
                 all_categories = [str(val) for val in X[col].unique()]
                 dummy_cols = [c.split("_", 1)[-1] for c in one_hot_encoded.columns if c.startswith(col + "_")]
@@ -501,7 +553,7 @@ class IGANN:
         else:
             X = X_cat
 
-        # vei:
+        # Veitl: store encoded feature indices for later (even though encoded_list already has it, we use this format)
         if len(categorical_cols) > 0:
             self.grouped_encoded_features = [
                 [self.feature_names.index(c) for c in group]
@@ -740,8 +792,8 @@ class IGANN:
 
         counter_no_progress = 0
         best_iter = 0
-        best_y_hat = y_hat  # vei: store best y_hat for ELM_IT
-        best_y_hat_val = y_hat_val
+        best_y_hat = y_hat  # Veitl: store linear component y_hat (needed for ELM_IT y_tilde if no ELM was added)
+        best_y_hat_val = y_hat_val  # Veitl: store linear component y_hat of val data (needed for ELM_IT y_tilde if no ELM was added)
 
         # Sequentially fit one ELM after the other. Max number is stored in self.n_estimators.
         for counter in range(self.n_estimators):
@@ -802,8 +854,8 @@ class IGANN:
                 best_iter = counter + 1
                 best_loss = val_loss
                 counter_no_progress = 0
-                best_y_hat = y_hat  # vei: store best y_hat for ELM_IT
-                best_y_hat_val = y_hat_val
+                best_y_hat = y_hat  # Veitl: update best_y_hat when new base function in ELM was successfully added
+                best_y_hat_val = y_hat_val # Veitl: update best_y_hat for val data when new base function in ELM was successfully added
 
             if self.verbose >= 1:
                 self._print_results(
@@ -833,7 +885,7 @@ class IGANN:
             self.regressors = self.regressors[:best_iter]
             self.boosting_rates = self.boosting_rates[:best_iter]
 
-            # vei: AB HIER ELM_IT
+        # Veitl: from here on ELM_IT part starts
         if self.igann_it == True:
             if self.n_numerical_cols > 0 and self.n_categorical_cols > 0: # interaction term only possible if both numerical and categorical features are present
                 # update y_hat to prediction of best ELM iteration (or of initial model if no ELM was fitted)
@@ -850,7 +902,7 @@ class IGANN:
                     X_it = X[:, self.best_combination]
                     X_val_it = X_val[:, self.best_combination]
 
-                    # vei: store unique values of interaction features
+                    # Store unique interaction feature values
                     self.unique_it = torch.unique(X_it, dim=0)
 
                     counter_no_progress = 0
@@ -926,7 +978,7 @@ class IGANN:
 
         return best_loss
 
-    # vei:
+    # Veitl: added function to detect feature interaction using decision tree
     def _constraint_dt(self, X, y_tilde):
         """
         This function fits a decision tree to determine the most important combination of one 
@@ -940,7 +992,7 @@ class IGANN:
         best_combination = None
 
         for num_var, cat_var in product(numerical_features, categorical_features):
-            # Trainiere Modell mit den Variablen num_var und cat_var
+            # train model with one numerical and one categorical feature
             X_dt = X[:, [num_var] + cat_var]
             if self.task == 'regression':
                 tree = DecisionTreeRegressor(random_state=42, max_depth=3, criterion='squared_error')
@@ -966,10 +1018,8 @@ class IGANN:
 
         return best_combination
     
-    # vei:
+    # Veitl: added function to detect feature interaction using FAST method. Draft version, not fully developed, very inefficient for non-ordinal categorical features.
     def _FAST_detection(self, X, y_tilde, n_bins):
-        # andere funktionen einbauen
-        # X_complete_decoded evtl löschen
         """
         FAST - Interaction Detection
 
@@ -978,12 +1028,10 @@ class IGANN:
 
         [1] https://www.cs.cornell.edu/~yinlou/papers/lou-kdd13.pdf
 
-        Args:
-            X (torch.Tensor): Feature-Matrix.
-            y_tilde (torch.Tensor): Residuals of univariate model.
-            n_bins (int): Number of bins in which the numerical features are split. Defaults to 20.
-            Returns:
-            dict: Ein Dictionary mit den Ergebnissen.
+        Input parameters:
+        - X (torch.Tensor): Feature-Matrix.
+        - y_tilde (torch.Tensor): Residuals of univariate model.
+        - n_bins (int): Number of bins in which the numerical features are split. Defaults to 20.
         """
         # Split X in numerical and categorical features
         # X_num
@@ -1173,256 +1221,11 @@ class IGANN:
 
         return best_combination
     
-    # # vei:
-    # def _extract_rules_from_tree(self, tree):
-    #     rules = []
-
-    #     def _traverse(node_id=0, conditions=None):
-    #         if conditions is None:
-    #             conditions = []
-
-    #         # Check if the node is a leaf
-    #         if tree.children_left[node_id] == tree.children_right[node_id]:
-    #             support = tree.n_node_samples[node_id] / tree.n_node_samples[0]
-    #             if conditions:
-    #                 rules.append({'conditions': conditions, 'support': support})
-    #             return
-
-    #         # Get the feature and threshold for the current node
-    #         feature = tree.feature[node_id]
-    #         threshold = tree.threshold[node_id]
-
-    #         _traverse(tree.children_left[node_id], conditions + [(feature, '<=', threshold)])
-    #         _traverse(tree.children_right[node_id], conditions + [(feature, '>', threshold)])
-        
-    #     _traverse()
-    #     return rules
-
-    # # vei:
-    # def filter_valid_rules(self, rules):
-    #     """
-    #     Filters rules to only keep those that involve exactly:
-    #     - One numerical feature
-    #     - One categorical feature group (which can map to multiple one-hot features)
-    #     """
-    #     filtered_rules = []
-    #     categorical_features = self.grouped_encoded_features
-    #     cat_feat2group = {
-    #         feat: gid
-    #         for gid, group in enumerate(categorical_features)
-    #         for feat in group
-    #     }
-
-    #     for rule in rules:
-    #         num_feature = None
-    #         cat_group = None
-    #         valid = True
-
-    #         for feat, _, _ in rule['conditions']:
-    #             if feat < self.n_numerical_cols:
-    #                 if num_feature is None:
-    #                     num_feature = feat
-    #                 else:
-    #                     valid = False
-    #                     break
-    #             else:
-    #                 g = cat_feat2group.get(feat)
-    #                 if g is None:
-    #                     valid = False
-    #                     break
-    #                 if cat_group is None:
-    #                     cat_group = g
-    #                 elif cat_group != g:
-    #                     valid = False
-    #                     break
-
-    #         if valid and num_feature is not None and cat_group is not None:
-    #             filtered_rules.append(rule)
-
-    #     return filtered_rules
-
-    
-    # # vei:
-    # def _rule_activity_matrix(self, rules, X):
-    #     """
-    #     Binary Matrix indicating which rules are active for each observation in X.
-    #     """
-    #     n, m = X.shape[0], len(rules)
-    #     A = torch.ones((n, m), dtype=torch.bool, device=X.device)
-
-    #     for i, rule in enumerate(rules):
-    #         for feature, op, threshold in rule['conditions']:
-    #             if op == '<=':
-    #                 A[:, i] &= X[:, feature] <= threshold
-    #             else:
-    #                 A[:, i] &= X[:, feature] > threshold
-
-    #     A = A.cpu().numpy()
-        
-    #     return A.astype(float)
-    
-    # # vei:
-    # def _top_rulefit_interaction(
-    #         self, X, y_tilde,
-    #         tree_leaves=5,
-    #         n_trees=100,):
-    #     """
-    #     This function applies the RuleFit algorithm (Friedman and Popescu, 2008) to determine the most important combination of one 
-    #     categorical and one numberical feature.
-    #     """
-    #     # Fit ensemble of decision trees
-    #     if self.task == 'regression':
-    #         base_tree = DecisionTreeRegressor(random_state=self.random_state, max_leaf_nodes=tree_leaves)
-
-    #         bagger = BaggingRegressor(
-    #             estimator=base_tree,
-    #             n_estimators=n_trees,
-    #             max_samples=0.5,
-    #             bootstrap=True,
-    #             random_state=self.random_state,
-    #         )
-
-    #     else:
-    #         base_tree = DecisionTreeClassifier(random_state=self.random_state, max_leaf_nodes=tree_leaves)
-
-    #         bagger = BaggingClassifier(
-    #             estimator=base_tree,
-    #             n_estimators=n_trees,
-    #             max_samples=0.5,
-    #             bootstrap=True,
-    #             random_state=self.random_state,
-    #         )
-
-    #     bagger.fit(X, y_tilde)
-
-    #     # Extract rules from the decision trees
-    #     rules = []
-    #     for est in bagger.estimators_:
-    #         tree_rules =  self._extract_rules_from_tree(est.tree_)
-    #         rules.extend(tree_rules)
-
-    #     filtered_rules = self.filter_valid_rules(rules)
-    #     A = self._rule_activity_matrix(filtered_rules, X)
-    #     supports = np.array([r["support"] for r in filtered_rules])
-
-    #     # Create a binary matrix indicating which rules are active for each observation in X
-    #     #A = self._rule_activity_matrix(rules, X)
-    #     #supports = np.array([r["support"] for r in rules])
-
-    #     scaler = StandardScaler(with_mean=False)
-    #     A_std = scaler.fit_transform(A)
-    #     # L1-Regression to find the most important rules
-    #     if self.task == 'regression':
-    #         lasso = LassoCV(cv=5, random_state=self.random_state, n_jobs=-1, max_iter=10000)
-    #         lasso.fit(A_std, y_tilde)
-    #         coefs = lasso.coef_
-    #     else:
-    #         logreg = LogisticRegressionCV(penalty="l1", solver="liblinear", Cs=np.logspace(-4, 2, 15), cv=5, scoring='neg_log_loss', n_jobs=-1, max_iter=5000, random_state=self.random_state)
-    #         logreg.fit(A_std, y_tilde)
-    #         coefs = logreg.coef_.ravel_
-
-    #     # Rule Importance
-    #     importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
-    #     active_idx   = np.nonzero(importances)[0]  
-
-    #     # # filter rules with only one numerical feature and one categorical feature
-    #     # filtered_rules = defaultdict(float)
-    #     # categorical_features = self.grouped_encoded_features
-    #     # cat_feat2group = {
-    #     #     feat: gid
-    #     #     for gid, group in enumerate(self.grouped_encoded_features)
-    #     #     for feat in group
-    #     # }
-
-    #     # for i in active_idx:
-    #     #     rule = rules[i]
-    #     #     imp = importances[i]
-    #     #     num_feature = None
-    #     #     cat_group = None
-    #     #     valid = True
-
-    #     #     # extract features from the rule
-    #     #     for feat, _, _ in rule['conditions']:
-    #     #         if feat < self.n_numerical_cols:
-    #     #             if num_feature is None:
-    #     #                 num_feature = feat
-    #     #             else:
-    #     #                 valid = False
-    #     #                 break
-    #     #         else:
-    #     #             g = cat_feat2group.get(feat)
-    #     #             if cat_group is None:
-    #     #                 cat_group = g
-    #     #             elif cat_group != g:
-    #     #                 valid = False
-    #     #                 break
-
-    #     #     if valid and num_feature is not None and cat_group is not None:
-    #     #         filtered_rules[(num_feature, cat_group)] += imp
-
-    #     # if not filtered_rules:
-    #     #     print('No feature combination found. Model does not capture interactions. Try different feature interaction detection method.')
-    #     #     self.igann_it = False
-
-    #     #     return None
-        
-    #     # final_importances = defaultdict(float)
-    #     # for key, value in filtered_rules.items():
-    #     #     final_importances[key] += value
-
-    #     # best_key = max(final_importances, key=final_importances.get)
-    #     # num_var, cat_var = best_key
-
-    #     # best_combination = [num_var] + categorical_features[cat_var]
-
-    #     # return best_combination
-    #     # Aufbau: Mapping von (num_feat, cat_group) → Importance
-
-    #     final_importances = defaultdict(float)
-    #     cat_feat2group = {
-    #         feat: gid
-    #         for gid, group in enumerate(self.grouped_encoded_features)
-    #         for feat in group
-    #     }
-
-    #     for i in active_idx:
-    #         rule = filtered_rules[i]
-    #         imp = importances[i]
-    #         num_feature = None
-    #         cat_group = None
-    #         valid = True
-
-    #         for feat, _, _ in rule['conditions']:
-    #             if feat < self.n_numerical_cols:
-    #                 if num_feature is None:
-    #                     num_feature = feat
-    #                 else:
-    #                     valid = False
-    #                     break
-    #             else:
-    #                 g = cat_feat2group.get(feat)
-    #                 if cat_group is None:
-    #                     cat_group = g
-    #                 elif cat_group != g:
-    #                     valid = False
-    #                     break
-
-    #         if valid and num_feature is not None and cat_group is not None:
-    #             final_importances[(num_feature, cat_group)] += imp
-
-    #     # Best Combination bestimmen
-    #     best_key = max(final_importances, key=final_importances.get)
-    #     num_var, cat_group = best_key
-    #     best_combination = [num_var] + self.grouped_encoded_features[cat_group]
-
-    #     return best_combination
-
-
-    # ---------------------------------------------------------------------------
-    # 1) Regeln aus Entscheidungsbaum extrahieren
-    # ---------------------------------------------------------------------------
+    # Veitl: helper function for RuleFit interaction detection
     def _extract_rules_from_tree(self, tree):
-        """Tiefensuche durch den Baum und Sammeln aller Blatt-Regeln."""
+        """
+        Iterates through a decision tree and extracts rules.
+        """
         rules = []
 
         def _traverse(node_id=0, conditions=None):
@@ -1446,19 +1249,13 @@ class IGANN:
 
         _traverse()
         return rules
-    # ---------------------------------------------------------------------------
 
-
-    # ---------------------------------------------------------------------------
-    # 2) Gültige Regeln (1 num + 1 cat-Gruppe) filtern
-    # ---------------------------------------------------------------------------
+    # Veitl: helper function for RuleFit interaction detection to filter extracted rules
     def filter_valid_rules(self, rules):
         """
-        Behalte nur Regeln, die genau
-        • ein numerisches Feature und
-        • eine (ggf. mehrere one-hot-Spalten umfassende) kategoriale Gruppe
-        enthalten.
+        Keeps only rules that contain exactly one numerical feature, and one categorical feature group (which may cover multiple one-hot encoded columns).
         """
+
         filtered = []
         cat_feat2group = {
             feat: gid
@@ -1475,7 +1272,7 @@ class IGANN:
                 if feat < self.n_numerical_cols:          # numerisch
                     if num_feature is None:
                         num_feature = feat
-                    else:                                 # zwei numerische ⇒ raus
+                    else:                                 # zwei numerische -> raus
                         valid = False
                         break
                 else:                                     # kategoriale OHE-Spalte
@@ -1485,7 +1282,7 @@ class IGANN:
                         break
                     if cat_group is None:
                         cat_group = g
-                    elif cat_group != g:                  # zwei Gruppen ⇒ raus
+                    elif cat_group != g:                  # zwei Gruppen -> raus
                         valid = False
                         break
 
@@ -1493,17 +1290,11 @@ class IGANN:
                 filtered.append(rule)
 
         return filtered
-    # ---------------------------------------------------------------------------
 
-
-    # ---------------------------------------------------------------------------
-    # 3) Aktivitätsmatrix
-    # ---------------------------------------------------------------------------
+    # Veitl: helper function for RuleFit interaction detection to list the activity of rules
     def _rule_activity_matrix(self, rules, X):
         """
-        Gibt eine (n × m)-Matrix zurück (float), in der A[i,j]=1, falls
-        Regel j für Beobachtung i aktiv ist. Bei leerer Regelliste wird
-        eine Matrix mit 0 Spalten zurückgegeben.
+        Returns (n × m) float matrix: A[i,j] = 1 if rule j is active for observation i.
         """
         n = X.shape[0]
         m = len(rules)
@@ -1518,26 +1309,24 @@ class IGANN:
                 else:
                     A[:, j] &= X[:, feature] >  thresh
         return A.cpu().numpy().astype(float)
-    # ---------------------------------------------------------------------------
 
-
-    # ---------------------------------------------------------------------------
-    # 4) Wichtigste 1×1-Interaktion via RuleFit-Importances
-    # ---------------------------------------------------------------------------
+    # Veitl: added function to detect feature interaction using RuleFit method.
     def _top_rulefit_interaction(
             self, X, y_tilde,
             tree_leaves=5,
             n_trees=100):
         """
-        Liefert die feature-Indices der wichtigsten Interaktion
-        [num_feature] + list(categorical_ohe_indices)
-        oder None, falls keine gültige Regel vorhanden ist.
+        Detects the most important interaction between a numerical and a categorical feature using the RuleFit method.
+        Creates rules from a bagging ensemble of decision trees and selects the most important interaction based on L1 regularization.
+
+        Input parameters:
+        - X: training data
+        - y_tilde: residuals of the IGANN model without interaction term
+        - tree_leaves: maximum number of leaves in each decision tree
+        - n_trees: number of trees in the ensemble
         """
 
-        # --------------------------------------------------
-        # 4.1 Ensemble trainieren
-        # --------------------------------------------------
-        #if self.task == 'regression':
+        # train a bagging ensemble of decision trees
         base_tree = DecisionTreeRegressor(
             random_state=self.random_state,
             max_leaf_nodes=tree_leaves)
@@ -1547,48 +1336,32 @@ class IGANN:
             max_samples=0.5,
             bootstrap=True,
             random_state=self.random_state)
-        # else:
-        #     base_tree = DecisionTreeClassifier(
-        #         random_state=self.random_state,
-        #         max_leaf_nodes=tree_leaves)
-        #     bagger = BaggingClassifier(
-        #         estimator=base_tree,
-        #         n_estimators=n_trees,
-        #         max_samples=0.5,
-        #         bootstrap=True,
-        #         random_state=self.random_state)
 
         bagger.fit(X, y_tilde)
 
-        # --------------------------------------------------
-        # 4.2 Regeln extrahieren & filtern
-        # --------------------------------------------------
+        # Extract rules from the decision trees in the ensemble
         rules = []
         for est in bagger.estimators_:
             rules.extend(self._extract_rules_from_tree(est.tree_))
 
+        # Filter rules to keep only those with one numerical and one categorical feature
         filtered_rules = self.filter_valid_rules(rules)
-        if len(filtered_rules) == 0:                 # ← kein Kandidat
+        if len(filtered_rules) == 0:                 # if no valid rules found
             self.igann_it = False
             return None
 
-        # --------------------------------------------------
-        # 4.3 Aktivitätsmatrix & Support
-        # --------------------------------------------------
+        # Activity matrix if rule j is active for observation i
         A         = self._rule_activity_matrix(filtered_rules, X)
         supports  = np.array([r['support'] for r in filtered_rules])
 
-        # --------------------------------------------------
-        # 4.4 L1-Modell (Lasso / L1-LogReg)
-        # --------------------------------------------------
+        # L1-Modell on acitivity matrix to determine importance of rules
         scaler = StandardScaler(with_mean=False)
         A_std  = scaler.fit_transform(A)
 
-        if A_std.shape[1] == 0:                     # sollte hier nie passieren,
-            self.igann_it = False                   # da len(filtered_rules) > 0,
-            return None                             # aber zur Sicherheit.
+        if A_std.shape[1] == 0:                     # sollte hier nie passieren, da len(filtered_rules) > 0, aber zur Sicherheit
+            self.igann_it = False
+            return None
 
-        #if self.task == 'regression':
         lasso = LassoCV(cv=5,
                         random_state=self.random_state,
                         n_jobs=-1,
@@ -1596,22 +1369,7 @@ class IGANN:
         lasso.fit(A_std, y_tilde)
         coefs = lasso.coef_
 
-        # else:
-        #     logreg = LogisticRegressionCV(
-        #         penalty='l1',
-        #         solver='liblinear',
-        #         Cs=np.logspace(-4, 2, 15),
-        #         cv=5,
-        #         scoring='neg_log_loss',
-        #         n_jobs=-1,
-        #         max_iter=5_000,
-        #         random_state=self.random_state)
-        #     logreg.fit(A_std, y_tilde)
-        #     coefs = logreg.coef_.ravel_
-
-        # --------------------------------------------------
-        # 4.5 Rule-Importances & Mapping auf (num, cat_group)
-        # --------------------------------------------------
+        # add up importances of feature interaction candidates from rule importances
         importances = np.abs(coefs) * np.sqrt(supports * (1 - supports))
         active_idx  = np.nonzero(importances)[0]
 
@@ -1648,9 +1406,7 @@ class IGANN:
             if valid and num_feature is not None and cat_group is not None:
                 final_imps[(num_feature, cat_group)] += imp
 
-        # --------------------------------------------------
-        # 4.6 Beste Interaktion bestimmen
-        # --------------------------------------------------
+        # determine best interaction pair
         if len(final_imps) == 0:
             print('No feature combination found. Model does not capture interactions. Try different feature interaction detection method.')
             self.igann_it = False
@@ -1662,8 +1418,7 @@ class IGANN:
 
         return best_comb
 
-    
-    # vei:
+    # Veitl: helper function to select and run the chosen interaction detection method
     def _find_interactions(self, X, y_tilde, method="dt"):
         """
         This function finds the most important interaction pair between a numerical and a categorical feature.
@@ -1847,7 +1602,7 @@ class IGANN:
         pred_nn = torch.zeros(len(X), dtype=torch.float32).to(self.device)
         for boost_rate, regressor in zip(self.boosting_rates, self.regressors):
             pred_nn += boost_rate * regressor.predict(X).squeeze()
-        # vei:
+        # Veitl: add shape function for interaction term
         if self.igann_it == True:
             for boost_rate, regressor in zip(self.boosting_rates_it, self.regressors_it):
                 pred_nn += boost_rate * regressor.predict(X[:, self.best_combination]).squeeze()
@@ -1885,7 +1640,7 @@ class IGANN:
             ).cpu()
         return feat_values, pred
     
-    # vei:
+    # Veitl: helper function for interaction effect plot. predicts interaction effect for unique values of the interaction pair
     def _get_pred_it(self):
         feat_values = self.unique_it
 
@@ -1901,6 +1656,7 @@ class IGANN:
         feat_values = feat_values.to(self.device)
         pred_it = torch.zeros(len(feat_values), dtype=torch.float32).to(self.device)
 
+        # interaction effect
         for regressor, boost_rate in zip(self.regressors_it, self.boosting_rates_it):
             pred_it += (
                 boost_rate
@@ -1909,12 +1665,10 @@ class IGANN:
 
         pred = pred_it.clone()
 
-        if self.task == "classification":
-            # to - do
-            print('classification not implemented yet')
-        else:
-            pred += (torch.from_numpy(self.init_classifier.coef_[self.best_combination].astype(np.float32)) @ feat_values.transpose(0,1))
+        # linear effect
+        pred += (torch.from_numpy(self.init_classifier.coef_[self.best_combination].astype(np.float32)) @ feat_values.transpose(0,1))
         
+        # main ELM effect
         for regressor, boost_rate in zip(self.regressors, self.boosting_rates):
             pred += (boost_rate * regressor.predict_it(feat_values, self.best_combination).squeeze()).cpu()
 
@@ -1998,9 +1752,8 @@ class IGANN:
 
         return shape_functions
     
-    # vei:
+    # Veitl: helper function to plot the shape functions for the interaction term (for plot_it)
     def get_it_shape_functions_as_dict(self, scaler, y_mean, y_std):
-        # predict for each unique combination of the best interaction pair. unique combinations are stored in self.unique_it and get return by self._get_pred_it()
         feat_values, pred_it, pred = self._get_pred_it()
 
         # scale values back to original values
@@ -2230,161 +1983,52 @@ class IGANN:
                 axs[1][i].get_yaxis().set_visible(False)
         plt.show()
 
-    # vei:
-    def plot_it(self, scaler, y_mean, y_std, include_univariate=False):
-        if include_univariate:
-            y_values = "y_incl_univ"
-        else:
-            y_values = "y"
+    # Veitl: function to plot interaction effect
+    def plot_it(self, scaler, y_mean, y_std, cumulative=False):
+        """
+        Plots the interaction effect (shape functions) for the selected feature interaction.
+
+        Input parameters:
+        - scaler: used to rescale numerical feature
+        - y_mean: mean of target variable (for rescaling)
+        - y_std: standard deviation of target variable (for rescaling)
+        - cumulative: if True, plots cumulative effect
+        """
+
+        y_values = "y_incl_univ" if cumulative else "y"
 
         shape_functions = self.get_it_shape_functions_as_dict(scaler, y_mean, y_std)
-        plt.close(fig="Shape functions")
 
-        # Seaborn-Theme nur für diesen Plot aktivieren
-        with sns.axes_style("whitegrid",
-                            {"grid.color": "#f0f0f0",
-                             "axes.edgecolor": "0.3",
-                             "axes.linewidth": 1}
-                             ):
-            
-            sns.set_context("notebook", font_scale=1)
-            
-            #colors = sns.color_palette("rocket_r", n_colors=len(shape_functions))
-            colors = ["#27AE60", "#7D3C98", "#E74C3C", "#2E86C1", "#F39C12"]
+        plt.figure(figsize=(8, 6), dpi=100)
+        colors = sns.color_palette("tab10", n_colors=len(shape_functions))
 
-            fig, axs = plt.subplots(1, 1, figsize=(8, 7), num="Shape functions", constrained_layout=False, dpi=100) # dpi für Masterarbeit dann auf 2 bis 300 erhöhen
-            
-            fig.patch.set_alpha(0)  # Transparenter Hintergrund für Figur
-
-
-            for i, d in enumerate(shape_functions):
-                color = colors[i % len(colors)]
-                if i == 0:
-                    feature_name = self.dropped_categories[self.feature_names[self.best_combination[1]].split("_")[0]]
-                else:
-                    feature_name = self.feature_names[self.best_combination[i]].split("_")[1]
-
-                axs.plot(d["x"], d[y_values], linewidth=2.5, color=color, alpha=0.8, 
-                        label=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}")
-
-                axs.axhline(y=0, color="#404040", linestyle="-", linewidth=0.8, alpha=0.6)
-
-            #axs.set_xlabel(self.feature_names[self.best_combination[0]], fontsize=14, labelpad=10, fontweight='semibold')
-            axs.set_xlabel("Mileage (km)", fontsize=16, labelpad=10, fontweight='semibold')
-            axs.set_ylabel("Contribution to Prediction of Claim Cost           ", fontsize=16, labelpad=10, fontweight='semibold')
-            axs.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x)}€"))
-            axs.yaxis.grid(True, linestyle='-', alpha=0.8, color="gray")
-            axs.xaxis.grid(True, linestyle='--', alpha=0.8, color="gray")
-            if include_univariate:
-                axs.yaxis.set_major_locator(MultipleLocator(100))
+        # Plot each shape function
+        for i, d in enumerate(shape_functions):
+            # Feature name
+            if i == 0:
+                feature_name = self.dropped_categories[self.feature_names[self.best_combination[1]].split("_")[0]]
             else:
-                axs.yaxis.set_major_locator(MultipleLocator(50))
+                feature_name = self.feature_names[self.best_combination[i]].split("_")[1]
 
-            axs.xaxis.set_major_locator(MultipleLocator(25000))
+            # Plot line
+            plt.plot(d["x"], d[y_values], linewidth=2.0, color=colors[i],
+                    label=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}")
 
-            axs.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-            #axs.set_title(f"Interaction Effect: Mileage x Car Type", fontsize=16, fontweight="bold", pad=15)
+        # Axis labels
+        plt.xlabel(self.feature_names[self.best_combination[0]], fontsize=14)
+        plt.ylabel("Contribution to Prediction", fontsize=14)
 
-            axs.tick_params(axis='x', labelrotation=45, labelsize=16)
-            axs.tick_params(axis='y', labelsize=16)
-            axs.grid(visible=True, which='major', axis='both', linestyle='--', alpha=0.6)
-            #axs.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=12, frameon=True, shadow=False, fancybox=True, borderpad=1)
-            axs.legend(loc="upper center", bbox_to_anchor=(0.5, -0.3), ncol=2, fontsize=16, frameon=True)
+        # Format ticks
+        plt.gca().yaxis.set_major_locator(mticker.AutoLocator())
+        plt.gca().xaxis.set_major_locator(mticker.AutoLocator())
+        plt.gca().xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
 
-            axs.spines["bottom"].set_color("#404040")  # Untere Linie dunkelgrau
-            axs.spines["left"].set_color("#404040")    # Linke Linie dunkelgrau
-            axs.spines["bottom"].set_linewidth(0.8)  # Untere Linie dicker machen
-            axs.spines["left"].set_linewidth(0.8)    # Linke Linie dicker machen
-            sns.despine(left=False, bottom=False)
-            plt.tight_layout(rect=[0, 0.1, 1, 1])
-            #plt.tight_layout(rect=[0, 0, 0.85, 0.95])  # Platz für Legende lassen
-            #plt.subplots_adjust(right=0.8)  # Rechts mehr Platz für Legende
-            #plt.gca().set_facecolor('none')  # Hintergrund des Achsenbereichs transparent machen
-            plt.subplots_adjust(bottom=0.4)
-            plt.show()
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend(loc="best", fontsize=12)
 
+        plt.tight_layout()
+        plt.show()
 
-    # vei: interaktiver Plot
-    # def plot_it(self):
-    #     shape_functions = self.get_it_shape_functions_as_dict()
-
-    #     colors = px.colors.sequential.Viridis[::-1]  # Ähnliche Farbpalette wie "rocket_r"
-        
-    #     fig = go.Figure()
-
-    #     # Erstellen der Daten für beide Y-Werte
-    #     traces_y_incl_univ = []
-    #     traces_y = []
-
-    #     for i, d in enumerate(shape_functions):
-    #         color = colors[i % len(colors)]
-            
-    #         if i == 0:
-    #             feature_name = self.dropped_categories[self.feature_names[self.best_combination[1]].split("_")[0]]
-    #         else:
-    #             feature_name = self.feature_names[self.best_combination[i]].split("_")[1]
-
-    #         # Linien für y_incl_univ
-    #         traces_y_incl_univ.append(go.Scatter(
-    #             x=d["x"],
-    #             y=d["y_incl_univ"],
-    #             mode="lines",
-    #             line=dict(color=color, width=2.5),
-    #             name=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}",
-    #             visible=True  # Standardmäßig sichtbar
-    #         ))
-
-    #         # Linien für y (die alternative Option)
-    #         traces_y.append(go.Scatter(
-    #             x=d["x"],
-    #             y=d["y"],
-    #             mode="lines",
-    #             line=dict(color=color, width=2.5, dash="dot"),  # Gepunktete Linien als Unterschied
-    #             name=f"{self.feature_names[self.best_combination[-1]].split('_')[0]}: {feature_name}",
-    #             visible=False  # Standardmäßig unsichtbar
-    #         ))
-
-    #     # Beide Trace-Gruppen zur Figur hinzufügen
-    #     for trace in traces_y_incl_univ:
-    #         fig.add_trace(trace)
-    #     for trace in traces_y:
-    #         fig.add_trace(trace)
-
-    #     # Layout & Styling
-    #     fig.update_layout(
-    #         title_text=f"Feature Interaction: Contribution of {self.feature_names[self.best_combination[0]]} and "
-    #                 f"{self.feature_names[self.best_combination[-1]].split('_')[0]} to the Prediction",
-    #         title_font=dict(size=16, family="Arial", color="black"),
-    #         xaxis=dict(title=self.feature_names[self.best_combination[0]], tickangle=45, tickfont=dict(size=12)),
-    #         yaxis=dict(title="Contribution to Prediction $\\hat{y}$", title_font=dict(size=14)),
-    #         plot_bgcolor="#f5f5f5",
-    #         legend=dict(x=1.02, y=1, bgcolor="rgba(255,255,255,0.5)", bordercolor="black", borderwidth=1),
-    #         margin=dict(r=200, t=80, b=50, l=60),  # Mehr Platz für die Legende
-    #         updatemenus=[
-    #             {
-    #                 "buttons": [
-    #                     {
-    #                         "label": "y_incl_univ",
-    #                         "method": "update",
-    #                         "args": [{"visible": [True] * len(traces_y_incl_univ) + [False] * len(traces_y)}]
-    #                     },
-    #                     {
-    #                         "label": "y",
-    #                         "method": "update",
-    #                         "args": [{"visible": [False] * len(traces_y_incl_univ) + [True] * len(traces_y)}]
-    #                     }
-    #                 ],
-    #                 "direction": "down",
-    #                 "showactive": True,
-    #                 "x": 0.17,
-    #                 "xanchor": "left",
-    #                 "y": 1.15,
-    #                 "yanchor": "top"
-    #             }
-    #         ]
-    #     )
-
-    #     fig.show()
 
 
     def plot_learning(self):
