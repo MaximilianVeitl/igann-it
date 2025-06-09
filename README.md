@@ -37,3 +37,11 @@ This repository is available at: [https://github.com/MaximilianVeitl/igann-it](h
 - Dataset: [catelematic13](https://www2.math.uconn.edu/~valdez/data.html)  
 - Reference:  
   Banghee So, Jean-Philippe Boucher, and Emiliano A. Valdez (2021), *Synthetic Dataset Generation of Driver Telematics*, *Risks* 9:58, [doi:10.3390/risks9040058](https://doi.org/10.3390/risks9040058)
+
+---
+
+## Datasets for Evaluation
+
+The datasets used for the evaluation of IGANN-IT (in `02_igann_it_evaluation_final.ipynb`) are based on the datasets provided by the [whiteboxai/datasets](https://github.com/whiteboxai/datasets) repository.  
+
+Link: [https://github.com/whiteboxai/datasets](https://github.com/whiteboxai/datasets)
